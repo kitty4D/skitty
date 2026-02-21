@@ -1,0 +1,39 @@
+# Dependencies
+node_modules
+
+# Build / output
+dist
+build
+.vite
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Editor / IDE
+.cursor
+.cursorrules
+.vscode
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Optional
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.vercel

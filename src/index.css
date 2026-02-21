@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: 'Inter', system-ui, sans-serif;
+  background-color: #000000;
+  color: #ffffff;
+}
+
+/* styled scrollbar for action panels */
+.action-panel-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.action-panel-scroll::-webkit-scrollbar-track {
+  background: #000000;
+  border: 1px solid #1a1a1a;
+}
+.action-panel-scroll::-webkit-scrollbar-thumb {
+  background: #1a1a1a;
+  border: 2px solid #000000;
+}
+.action-panel-scroll::-webkit-scrollbar-thumb:hover {
+  background: #a855f7;
+}
+.action-panel-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #1a1a1a #000000;
+}
+
+/* small horizontal scrollbar for overflow labels (e.g. ActionCard) */
+.label-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(26, 26, 26, 0.8) transparent;
+}
+.label-scroll::-webkit-scrollbar {
+  height: 6px;
+}
+.label-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.label-scroll::-webkit-scrollbar-thumb {
+  background: rgba(26, 26, 26, 0.8);
+  border-radius: 3px;
+}
+.label-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(168, 85, 247, 0.6);
+}

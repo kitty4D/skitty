@@ -1,0 +1,64 @@
+{
+  "name": "skitty - sui reclaimer",
+  "version": "1.0.0",
+  "description": "Reclaim SUI from storage rebates: merge coins, close empty kiosks, burn spam NFTs. Connect wallet or paste any Sui address.",
+  "private": false,
+  "license": "MIT",
+  "keywords": [
+    "sui",
+    "crypto",
+    "web3",
+    "wallet",
+    "burn",
+    "reclaim",
+    "blockchain"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kitty4D/skitty.git"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@mysten/dapp-kit": "^1.0.3",
+    "@mysten/sui": "^2.4.0",
+    "@mysten/suins": "^1.0.2",
+    "@radix-ui/react-switch": "^1.2.6",
+    "@tanstack/react-query": "^5.90.21",
+    "@upstash/ratelimit": "^2.0.8",
+    "@upstash/redis": "^1.36.2",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "framer-motion": "^12.34.3",
+    "graphql": "^16.12.0",
+    "lucide-react": "^0.575.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwind-merge": "^3.5.0",
+    "tailwindcss-animate": "^1.0.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.13.0",
+    "@shadcn/ui": "^0.0.4",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "autoprefixer": "^10.4.20",
+    "eslint": "^9.13.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "eslint-plugin-react-refresh": "^0.4.14",
+    "globals": "^15.11.0",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.14",
+    "typescript": "~5.6.2",
+    "typescript-eslint": "^8.11.0",
+    "vite": "^6.0.0",
+    "vite-plugin-vercel": "^9.1.1"
+  }
+}
