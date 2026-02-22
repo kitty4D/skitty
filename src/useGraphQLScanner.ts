@@ -86,6 +86,41 @@ export function useGraphQLScanner(address: string | null) {
     }
   }, [address]);
 
+  const refreshAfterExecute = React.useCallback(async (executedActions: CleanupAction[]) => {
+    if (executedActions.length === 0) return;
+    const allIds = [...new Set(executedActions.flatMap((a) => a.objectIds))];
+    if (allIds.length === 0) return;
+    try {
+      const responses = await rpcClient.multiGetObjects({
+        ids: allIds,
+        options: {},
+      });
+      const existingIds = new Set<string>();
+      responses.forEach((res, i) => {
+        if (res.data && allIds[i]) existingIds.add(allIds[i]);
+      });
+      const actionKey = (a: CleanupAction) =>
+        `${a.kind}:${a.objectIds.slice().sort().join(',')}`;
+      const keysToRemove = new Set<string>();
+      for (const a of executedActions) {
+        const allGone = a.objectIds.every((id) => !existingIds.has(id));
+        if (allGone) keysToRemove.add(actionKey(a));
+      }
+      if (keysToRemove.size === 0) return;
+      setState((prev) => {
+        const nextActions = prev.actions.filter((a) => !keysToRemove.has(actionKey(a)));
+        const totalUserRebateMist = nextActions.reduce((s, x) => s + x.userRebateMist, 0);
+        return {
+          ...prev,
+          actions: nextActions,
+          totalUserRebateMist,
+        };
+      });
+    } catch (err) {
+      console.error('Refresh after execute failed:', err);
+    }
+  }, []);
+
   React.useEffect(() => {
     setState(prev => ({
       ...prev,
@@ -96,7 +131,7 @@ export function useGraphQLScanner(address: string | null) {
     }));
   }, [address]);
 
-  return { state, scan };
+  return { state, scan, refreshAfterExecute };
 }
 
 // get coin balance from GraphQL contents.json (balance string or { value: string }); return 0n only when explicitly 0, else 1n so we don't destroy coins by mistake

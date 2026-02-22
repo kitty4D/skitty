@@ -105,7 +105,7 @@ export function ReclaimDashboard() {
   const [gasCoinId, setGasCoinId] = React.useState<string | null>(null);
   const [feeCoinId, setFeeCoinId] = React.useState<string | null>(null);
 
-  const { state, scan } = useGraphQLScanner(addressToUse);
+  const { state, scan, refreshAfterExecute } = useGraphQLScanner(addressToUse);
   const gasOwnerAddress = account?.address ?? state.scannedAddress ?? null;
 
   // when user hit submit with SuiNS before resolve finished, run scan once address is ready
@@ -163,10 +163,15 @@ export function ReclaimDashboard() {
     error?: string;
   } | null>(null);
   const [simulationModal, setSimulationModal] = React.useState<{
+    /** Net gain from formula (rebate - gas - fee); used when balance changes unavailable */
     netGainMist?: number;
+    /** Actual SUI balance change for sender from simulation (preferred for display) */
+    netInflowMist?: number;
     gasCostMist?: number;
     error?: string;
   } | null>(null);
+  /** Per-action simulated net inflow (from balance changes); card shows this when set so it matches wallet */
+  const [simulatedNetInflowByIndex, setSimulatedNetInflowByIndex] = React.useState<Record<number, number>>({});
   const [lastDryRunRawJson, setLastDryRunRawJson] = React.useState<string | null>(null);
   const [showRawSimulation, setShowRawSimulation] = React.useState(false);
   const [geminiExplanation, setGeminiExplanation] = React.useState<string | null>(null);
@@ -299,6 +304,8 @@ export function ReclaimDashboard() {
     }
     setExecuting(true);
     setExecuteError(null);
+    const clearExecuting = () => setExecuting(false);
+    const safetyTimeoutId = setTimeout(clearExecuting, 120_000);
     try {
       const tx = buildBatchTransaction(selectedActionList, gasId, totalStorageRebateMist, feeCoinId);
       tx.setSender(account.address);
@@ -322,20 +329,30 @@ export function ReclaimDashboard() {
       }
       const budget = gasBalanceMist < BigInt(DRY_RUN_GAS_BUDGET) ? String(gasBalanceMist) : String(DRY_RUN_GAS_BUDGET);
       tx.setGasBudget(budget);
-      await signAndExecute({ transaction: tx });
+      const result = await signAndExecute({ transaction: tx });
       setDryRunResult(null);
+      const executedActions = [...selectedActionList];
       setSelectedActions(new Set());
-      await scan();
+      if (result?.digest) {
+        await rpcClient.waitForTransaction({
+          digest: result.digest,
+          timeout: 30_000,
+          pollInterval: 500,
+        });
+      }
+      await refreshAfterExecute(executedActions);
+      setSimulatedNetInflowByIndex({});
     } catch (e) {
       console.error(e);
       setExecuteError(e instanceof Error ? e.message : String(e));
     } finally {
-      setExecuting(false);
+      clearTimeout(safetyTimeoutId);
+      clearExecuting();
     }
-  }, [account?.address, selectedActionList, signAndExecute, scan, gasCoinId, feeCoinId]);
+  }, [account?.address, selectedActionList, signAndExecute, refreshAfterExecute, gasCoinId, feeCoinId]);
 
   const runDryRunOne = React.useCallback(
-    async (action: CleanupAction) => {
+    async (action: CleanupAction, actionIndex: number) => {
       const senderAddress = account?.address ?? state.scannedAddress ?? null;
       if (!senderAddress) {
         setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: 'Scan an address or connect wallet to run simulation.' });
@@ -393,18 +410,18 @@ export function ReclaimDashboard() {
         const txBytes = await tx.build({ client: graphQLClient });
         const result = await graphQLClient.simulateTransaction({
           transaction: txBytes,
-          include: { effects: true },
+          include: { effects: true, balanceChanges: true },
         });
         const requestPayload = {
           transaction: transactionJson != null ? JSON.parse(transactionJson) : null,
           transactionBytesBase64: bytesToBase64(txBytes instanceof Uint8Array ? txBytes : new Uint8Array(txBytes)),
-          include: { effects: true },
+          include: { effects: true, balanceChanges: true },
         };
         setGeminiExplanation(null);
         setGeminiError(null);
         setLastDryRunRawJson(JSON.stringify({ request: requestPayload, response: result }, null, 2));
-        const effects =
-          result.$kind === 'Transaction' ? result.Transaction.effects : result.FailedTransaction?.effects;
+        const txResult = result.$kind === 'Transaction' ? result.Transaction : result.FailedTransaction;
+        const effects = txResult?.effects;
         if (!effects) {
           setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: 'No effects from dry run.' });
           setSimulationModal({ error: 'No effects from dry run.' });
@@ -417,8 +434,29 @@ export function ReclaimDashboard() {
           Number(gasUsed?.storageRebate ?? 0);
         const singleFeeMist = computeFeeMist(singleStorageRebate);
         const netGainMist = action.userRebateMist - Math.max(0, gasCostMist) - singleFeeMist;
+        let netInflowMist: number | undefined;
+        const balanceChanges = txResult.balanceChanges;
+        if (balanceChanges && senderAddress) {
+          const senderNorm = senderAddress.toLowerCase();
+          const suiTypeLower = '0x2::sui::sui';
+          for (const ch of balanceChanges) {
+            if (ch.address?.toLowerCase() === senderNorm && ch.coinType?.toLowerCase() === suiTypeLower) {
+              const amount = Number(ch.amount);
+              if (!Number.isNaN(amount)) netInflowMist = (netInflowMist ?? 0) + amount;
+            }
+          }
+        }
+        // Wallet "expected coin inflow" matches the gas credit when gas cost is negative (rebate > gas spent)
+        const expectedInflowMist =
+          netInflowMist ?? (gasCostMist <= 0 ? -gasCostMist : undefined) ?? netGainMist;
         setDryRunResult({ netGainMist, gasCostMist, error: undefined });
-        setSimulationModal({ netGainMist, gasCostMist, error: undefined });
+        setSimulationModal({
+          netGainMist,
+          netInflowMist: expectedInflowMist,
+          gasCostMist,
+          error: undefined,
+        });
+        setSimulatedNetInflowByIndex((prev) => ({ ...prev, [actionIndex]: expectedInflowMist }));
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e);
         setGeminiExplanation(null);
@@ -431,6 +469,11 @@ export function ReclaimDashboard() {
     [account?.address, state.scannedAddress, gasCoinId, feeCoinId]
   );
 
+  // Clear simulated yields when scan results change so we don't show stale numbers
+  React.useEffect(() => {
+    setSimulatedNetInflowByIndex({});
+  }, [state.scannedAddress, state.actions.length]);
+
   const executeOne = React.useCallback(
     async (action: CleanupAction) => {
       if (!account?.address) return;
@@ -440,6 +483,8 @@ export function ReclaimDashboard() {
       }
       setExecuting(true);
       setExecuteError(null);
+      const clearExecuting = () => setExecuting(false);
+      const safetyTimeoutId = setTimeout(clearExecuting, 120_000);
       try {
         const singleStorageRebate = Number(action.storageRebateTotal);
         const tx = buildBatchTransaction([action], gasCoinId, singleStorageRebate, feeCoinId);
@@ -464,18 +509,28 @@ export function ReclaimDashboard() {
         }
         const budget = gasBalanceMist < BigInt(DRY_RUN_GAS_BUDGET) ? String(gasBalanceMist) : String(DRY_RUN_GAS_BUDGET);
         tx.setGasBudget(budget);
-        await signAndExecute({ transaction: tx });
+        const result = await signAndExecute({ transaction: tx });
         setDryRunResult(null);
+        const executedActions = [action];
         setSelectedActions(new Set());
-        await scan();
+        if (result?.digest) {
+          await rpcClient.waitForTransaction({
+            digest: result.digest,
+            timeout: 30_000,
+            pollInterval: 500,
+          });
+        }
+        await refreshAfterExecute(executedActions);
+        setSimulatedNetInflowByIndex({});
       } catch (e) {
         console.error(e);
         setExecuteError(e instanceof Error ? e.message : String(e));
       } finally {
-        setExecuting(false);
+        clearTimeout(safetyTimeoutId);
+        clearExecuting();
       }
     },
-    [account?.address, signAndExecute, scan, gasCoinId, feeCoinId]
+    [account?.address, signAndExecute, refreshAfterExecute, gasCoinId, feeCoinId]
   );
 
   const feedSkitty = React.useCallback(async () => {
@@ -706,7 +761,7 @@ export function ReclaimDashboard() {
               <div>
                 <h2 className="font-display font-black text-4xl uppercase tracking-tighter leading-none">Recoverable Assets</h2>
                 <p className="text-xs font-black uppercase tracking-widest text-skitty-accent mt-2">
-                  Estimated Potential Yield: {formatSui(state.totalUserRebateMist)} SUI
+                  Est. net potential: {formatSui(state.actions.reduce((s, a) => s + Math.max(0, a.userRebateMist - computeFeeMist(Number(a.storageRebateTotal)) - a.estimatedGasMist), 0))} SUI
                 </p>
                 <p className="text-[9px] font-mono text-skitty-secondary/70 mt-0.5">
                   Based on current state; actual amounts at execution may differ.
@@ -757,7 +812,8 @@ export function ReclaimDashboard() {
                           notEconomical={action.netGainMist < 0}
                           interactive={scannedAddressIsConnectedWallet}
                           showSimulate
-                          onDryRun={() => runDryRunOne(action)}
+                          simulatedNetInflowMist={simulatedNetInflowByIndex[index]}
+                          onDryRun={() => runDryRunOne(action, index)}
                           onExecute={() => executeOne(action)}
                           executing={executing}
                         />
@@ -932,16 +988,18 @@ export function ReclaimDashboard() {
                 </div>
               ) : (
                 <div className="space-y-2 mb-4">
-                  <p className="text-xs font-black text-skitty-secondary uppercase tracking-widest">
-                    Est. gas
-                  </p>
-                  <p className="text-white font-black">{(simulationModal.gasCostMist ?? 0) >= 0 ? '-' : '+'}{formatSui(Math.abs(simulationModal.gasCostMist ?? 0))} SUI</p>
-                  <p className="text-xs font-black text-skitty-accent uppercase tracking-widest mt-3">
-                    Net gain (est.)
+                  <p className="text-xs font-black text-skitty-accent uppercase tracking-widest">
+                    Est. net inflow
                   </p>
                   <p className="text-skitty-accent font-black text-lg">
-                    {formatSui(simulationModal.netGainMist ?? 0)} SUI
+                    {simulationModal.netInflowMist !== undefined
+                      ? (simulationModal.netInflowMist >= 0 ? '+' : '') + formatSui(simulationModal.netInflowMist) + ' SUI'
+                      : formatSui(simulationModal.netGainMist ?? 0) + ' SUI'}
                   </p>
+                  <p className="text-xs font-black text-skitty-secondary uppercase tracking-widest mt-3">
+                    Gas cost (est.)
+                  </p>
+                  <p className="text-white font-black">{(simulationModal.gasCostMist ?? 0) >= 0 ? '-' : '+'}{formatSui(Math.abs(simulationModal.gasCostMist ?? 0))} SUI</p>
                   <p className="text-[9px] font-mono text-skitty-secondary/80 mt-2">
                     Actual amounts at execution may differ. Review in your wallet before approving.
                   </p>

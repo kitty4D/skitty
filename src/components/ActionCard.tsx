@@ -39,6 +39,7 @@ export function ActionCard({
   notEconomical = false,
   interactive = true,
   showSimulate = false,
+  simulatedNetInflowMist,
   onDryRun,
   onExecute,
   executing,
@@ -51,6 +52,8 @@ export function ActionCard({
   notEconomical?: boolean;
   interactive?: boolean;
   showSimulate?: boolean;
+  /** From simulation balance changes; when set, card shows this (matches wallet "you will receive") */
+  simulatedNetInflowMist?: number;
   onDryRun: () => void;
   onExecute: () => void;
   executing: boolean;
@@ -166,8 +169,14 @@ export function ActionCard({
 
         <div className="shrink-0 flex flex-col gap-2 items-end min-w-[7rem]">
           <div className="text-right space-y-0.5">
-            <p className="text-[10px] font-black text-skitty-secondary/40 tracking-widest">EST. YIELD</p>
-            <p className="text-sm font-black text-white leading-none tracking-tighter">+{formatSui(action.userRebateMist)}</p>
+            <p className="text-[10px] font-black text-skitty-secondary/40 tracking-widest">
+              {simulatedNetInflowMist !== undefined ? 'EST. NET YIELD' : 'RUN SIMULATE'}
+            </p>
+            <p className="text-sm font-black text-white leading-none tracking-tighter">
+              {simulatedNetInflowMist !== undefined
+                ? (simulatedNetInflowMist >= 0 ? '+' : '') + formatSui(simulatedNetInflowMist)
+                : '—'}
+            </p>
           </div>
 
           {(interactive || showSimulate) && (

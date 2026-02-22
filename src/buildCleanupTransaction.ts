@@ -11,7 +11,7 @@ export function computeFeeMist(totalStorageRebateMist: number): number {
   return Math.floor(totalStorageRebateMist * FEE_RATE);
 }
 
-// build one transaction that batches up to MAX_ACTIONS_PER_BATCH; never include gas in merge/destroy_zero; fee from feeCoinId (≠ gas) to FEE_RECIPIENT
+// build one transaction that batches up to MAX_ACTIONS_PER_BATCH; never include gas in merge/destroy_zero; fee from feeCoinId when different from gas, else from gas coin, to FEE_RECIPIENT
 export function buildBatchTransaction(
   actions: CleanupAction[],
   gasCoinId: string | null,
@@ -88,10 +88,12 @@ export function buildBatchTransaction(
     tx.mergeCoins(tx.object(primary!), rest.map((id) => tx.object(id)));
   }
 
-  // fee: split from a coin that is NOT the gas coin (each object used once)
+  // fee: split from a separate coin when available, otherwise from the gas coin (so fees are always collected)
   const feeMist = computeFeeMist(totalStorageRebateMist);
-  if (feeMist > 0 && feeCoinId && feeCoinId !== gasCoinId) {
-    const [feeCoin] = tx.splitCoins(tx.object(feeCoinId), [feeMist]);
+  const coinForFee =
+    feeCoinId && feeCoinId !== gasCoinId ? feeCoinId : gasCoinId;
+  if (feeMist > 0 && coinForFee) {
+    const [feeCoin] = tx.splitCoins(tx.object(coinForFee), [feeMist]);
     tx.transferObjects([feeCoin], tx.pure.address(FEE_RECIPIENT));
   }
 

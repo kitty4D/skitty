@@ -1,6 +1,7 @@
 import { motion, AnimatePresence } from 'framer-motion';
 import { Trash2, ChevronDown, ChevronUp, PartyPopper } from 'lucide-react';
 import { Button } from './ui/button';
+import { computeFeeMist } from '../buildCleanupTransaction';
 import { formatSui, shortLabelFromType } from '../utils/format';
 import type { CleanupAction } from '../types';
 
@@ -86,7 +87,7 @@ export function FloatingCart({
                   <span className="truncate max-w-[200px]" title={action.label ?? action.objectIds[0]}>
                     {shortLabelFromType(action.label ?? action.objectIds[0] ?? '')}
                   </span>
-                  <span className="shrink-0 text-white">+{formatSui(action.userRebateMist)} SUI</span>
+                  <span className="shrink-0 text-white">+{formatSui(Math.max(0, action.userRebateMist - computeFeeMist(Number(action.storageRebateTotal)) - action.estimatedGasMist))} SUI</span>
                 </motion.div>
               ))}
             </div>
