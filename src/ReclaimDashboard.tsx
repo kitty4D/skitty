@@ -377,7 +377,6 @@ export function ReclaimDashboard() {
       await refreshAfterExecute(executedActions);
       setSimulatedNetInflowByIndex({});
     } catch (e) {
-      console.error(e);
       setExecuteError(e instanceof Error ? e.message : String(e));
     } finally {
       clearTimeout(safetyTimeoutId);
@@ -395,7 +394,6 @@ export function ReclaimDashboard() {
       setDryRunResult(null);
       try {
         const singleStorageRebate = Number(action.storageRebateTotal);
-        console.debug('[Skitty simulate one]', { senderAddress, singleStorageRebate });
         const tx = buildBatchTransaction(
           [action],
           null,
@@ -479,7 +477,6 @@ export function ReclaimDashboard() {
         setSimulatedNetInflowByIndex((prev) => ({ ...prev, [actionIndex]: expectedInflowMist }));
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e);
-        console.debug('[Skitty simulate one] failed:', errMsg, e);
         setGeminiExplanation(null);
         setGeminiError(null);
         setLastDryRunRawJson(JSON.stringify({ request: null, response: { error: errMsg } }, null, 2));
@@ -624,7 +621,6 @@ export function ReclaimDashboard() {
         await refreshAfterExecute(executedActions);
         setSimulatedNetInflowByIndex({});
       } catch (e) {
-        console.error(e);
         setExecuteError(e instanceof Error ? e.message : String(e));
       } finally {
         clearTimeout(safetyTimeoutId);

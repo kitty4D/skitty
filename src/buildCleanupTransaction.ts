@@ -44,15 +44,6 @@ export function buildBatchTransaction(
   } else if (!sponsoredGas && feeMist > 0 && gasCoinBalanceMist == null) {
     feeMist = 0;
   }
-  console.debug('[Skitty buildBatchTransaction]', {
-    gasCoinId,
-    sponsoredGas,
-    gasCoinBalanceMist: gasCoinBalanceMist ?? '(not passed)',
-    totalStorageRebateMist,
-    feeBeforeCap,
-    feeAfterCap: feeMist,
-    estimatedGasMist: estimatedGasMist ?? '(not passed)',
-  });
 
   const mergeCoinsByType = new Map<string, string[]>();
   let actionCount = 0;

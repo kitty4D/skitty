@@ -35,6 +35,10 @@ export const KNOWN_BURNABLE: { typePattern: string; target: string }[] = [
   // ex. { typePattern: '0x...::token::Token', target: '0x...::token::burn' },
 ];
 
+// native SUI coin type arg: never suggest merge or destroy_zero for SUI (gas coin)
+export const SUI_COIN_TYPE_ARG = '0x2::sui::SUI';
+export const SUI_COIN_TYPE_ARG_LONG = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
+
 // core protected types: never suggest burn/destroy for these, even if a burn exists
 export const CORE_PROTECTED_TYPES: string[] = [
   '0x2::staking_pool::StakedSui',

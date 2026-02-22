@@ -93,14 +93,12 @@ export default async function handler(req, res) {
       const text = response?.text?.() ?? '';
       return res.status(200).json({ explanation: text });
     } catch (err) {
-      console.error('Gemini explain error:', err);
       return res.status(500).json({
         error: err?.message ?? 'Failed to get explanation from Gemini',
       });
     }
 
   } catch (error) {
-    console.error(error);
     return res.status(500).json({ error: "Something went wrong in the cat-cave." });
   }
 

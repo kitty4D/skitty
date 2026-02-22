@@ -12,7 +12,7 @@ import type {
   ScannerState,
   ScanProgress,
 } from './types';
-import { KNOWN_BURNABLE } from './constants';
+import { KNOWN_BURNABLE, SUI_COIN_TYPE_ARG, SUI_COIN_TYPE_ARG_LONG } from './constants';
 import { getCoinTypeArg, getWalletCoinBlocklist, getWalletObjectBlocklist } from './walletBlocklist';
 import type { SuiMoveNormalizedModule, SuiObjectData } from '@mysten/sui/jsonRpc';
 
@@ -77,7 +77,6 @@ export function useGraphQLScanner(address: string | null) {
         scannedAddress: address,
       }));
     } catch (error) {
-      console.error('Scan error:', error);
       setState(prev => ({
         ...prev,
         loading: false,
@@ -117,8 +116,8 @@ export function useGraphQLScanner(address: string | null) {
           totalUserRebateMist,
         };
       });
-    } catch (err) {
-      console.error('Refresh after execute failed:', err);
+    } catch {
+      // refresh after execute failed; state unchanged
     }
   }, []);
 
@@ -241,6 +240,7 @@ async function findCoinActionsByGraphQL(
       if (group.objectIds.length <= 1) continue;
       const typeArg = getCoinTypeArg(coinType);
       if (blocklist.has(typeArg)) continue;
+      if (typeArg === SUI_COIN_TYPE_ARG || typeArg === SUI_COIN_TYPE_ARG_LONG) continue;
       const userRebateMist = Math.floor(group.storageRebateTotal * REBATE_MULTIPLIER);
       const feeMist = computeFeeMist(group.storageRebateTotal);
       if (userRebateMist < estMerge + feeMist) continue;
@@ -263,6 +263,7 @@ async function findCoinActionsByGraphQL(
     for (const z of zeroBalanceCoins) {
       const typeArg = getCoinTypeArg(z.coinType);
       if (blocklist.has(typeArg)) continue;
+      if (typeArg === SUI_COIN_TYPE_ARG || typeArg === SUI_COIN_TYPE_ARG_LONG) continue;
       const userRebateMist = Math.floor(z.storageRebate * REBATE_MULTIPLIER);
       const feeMist = computeFeeMist(z.storageRebate);
       if (userRebateMist < estZero + feeMist) continue;
@@ -280,8 +281,7 @@ async function findCoinActionsByGraphQL(
     }
 
     return [...mergeActions, ...destroyZeroActions];
-  } catch (error) {
-    console.error('Error finding coin actions:', error);
+  } catch {
     return [];
   }
 }
@@ -353,8 +353,7 @@ async function findEmptyKiosksByGraphQL(
       });
     }
     return closeActions;
-  } catch (error) {
-    console.error('Error finding empty kiosks:', error);
+  } catch {
     return [];
   }
 }
@@ -379,8 +378,7 @@ async function isKioskEmptyByGraphQL(kioskId: string): Promise<boolean> {
     type AddressDynamicFields = { address?: { dynamicFields?: { nodes?: unknown[] } } };
     const nodes = (data as AddressDynamicFields)?.address?.dynamicFields?.nodes ?? [];
     return nodes.length === 0;
-  } catch (error) {
-    console.error(`Error checking if kiosk ${kioskId} is empty:`, error);
+  } catch {
     return false;
   }
 }
@@ -574,8 +572,7 @@ async function findBurnableObjectsByRPC(
       });
     }
     return burnActions;
-  } catch (error) {
-    console.error('Error finding burnable objects:', error);
+  } catch {
     return [];
   }
 }

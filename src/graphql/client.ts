@@ -32,8 +32,6 @@ export async function resolveSuiNSDomainViaGraphQL(domain: string): Promise<stri
       },
     });
     
-    console.log('GraphQL domain resolution result:', data);
-    
     type SuinsReg = { targetAddress?: string; ownerAddress?: string };
     const reg = (data as { suinsRegistration?: SuinsReg })?.suinsRegistration;
     
@@ -48,8 +46,7 @@ export async function resolveSuiNSDomainViaGraphQL(domain: string): Promise<stri
     }
     
     return null;
-  } catch (error) {
-    console.error('Error resolving domain via GraphQL:', error);
+  } catch {
     return null;
   }
 }

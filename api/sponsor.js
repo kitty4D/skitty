@@ -57,34 +57,7 @@ async function fetchSponsorCoinGQL(client, address) {
 }
 
 export default async function handler(req, res) {
-    if (req.method === 'GET') {
-        const allEnvKeys = Object.keys(process.env);
-        const isTargetPresent = allEnvKeys.includes('SUI_SPONSOR_PRIV');
-        const suiRelatedKeys = allEnvKeys.filter(key =>
-          key.toUpperCase().includes('SUI') || key.toUpperCase().includes('SPONSOR')
-        );
-
-        let sui_sponsor_pub = null;
-        if (isTargetPresent) {
-          try {
-            const kp = getHouseKeypair();
-            sui_sponsor_pub = kp.getPublicKey().toSuiAddress();
-          } catch (e) {
-            sui_sponsor_pub = '(key present but failed to derive address: ' + (e?.message || String(e)) + ')';
-          }
-        }
-
-        return res.status(200).json({
-          configured: isTargetPresent,
-          sui_sponsor_pub,
-          detectedSuiKeys: suiRelatedKeys,
-          totalKeysFound: allEnvKeys.length,
-          vitePrefixFound: allEnvKeys.includes('VITE_SUI_SPONSOR_PRIV'),
-          runtime: process.env.NODE_ENV || 'unknown',
-          hint: isTargetPresent ? null : 'Add SUI_SPONSOR_PRIV in Vercel → Project → Settings → Environment Variables. Enable for Production (and Preview if you use preview URLs). Then redeploy.',
-        });
-    }
-
+    
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
   try {
@@ -130,7 +103,6 @@ export default async function handler(req, res) {
       sponsorSignature: signature,
     });
   } catch (error) {
-    console.error('Sponsorship failed:', error);
     return res.status(500).json({ error: error?.message ?? 'Sponsorship failed' });
   }
 }
