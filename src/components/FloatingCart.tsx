@@ -17,6 +17,8 @@ export function FloatingCart({
   onViewRawSimulation,
   executing,
   accountConnected,
+  canSponsor = true,
+  lastSponsorImpact = null,
   isMinimized,
   onToggleMinimize,
 }: {
@@ -32,6 +34,10 @@ export function FloatingCart({
   onViewRawSimulation: () => void;
   executing: boolean;
   accountConnected: boolean;
+  /** false when rebate does not cover gas + fee; we do not sponsor */
+  canSponsor?: boolean;
+  /** sponsor's net SUI from last executed tx (for P&L visibility) */
+  lastSponsorImpact?: { digest: string; netMist: number } | null;
   isMinimized: boolean;
   onToggleMinimize: () => void;
 }) {
@@ -146,6 +152,23 @@ export function FloatingCart({
                 </div>
               )}
 
+              {lastSponsorImpact != null && (
+                <div className="bg-white/10 border border-white/20 p-2">
+                  <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">Sponsor net last tx</p>
+                  <p className={`text-sm font-black ${lastSponsorImpact.netMist >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {(lastSponsorImpact.netMist >= 0 ? '+' : '') + formatSui(lastSponsorImpact.netMist)} SUI
+                  </p>
+                  <a
+                    href={`https://suivision.xyz/txblock/${lastSponsorImpact.digest}?tab=Changes`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[9px] text-skitty-accent hover:underline"
+                  >
+                    View balance changes →
+                  </a>
+                </div>
+              )}
+
               <div className="flex flex-col gap-3 pt-2">
                 <p className="text-[9px] font-mono text-skitty-secondary/80 leading-snug">
                   Actual rebates and gas are set by the network at execution. Review the transaction in your wallet before approving.
@@ -158,14 +181,20 @@ export function FloatingCart({
                   <PartyPopper className="w-5 h-5 mr-2 shrink-0" />
                   Save the Objects!
                 </Button>
+                {!canSponsor && (
+                  <p className="text-[10px] font-black text-amber-500 uppercase tracking-widest">
+                    Rebate does not cover gas + fee — we do not sponsor this.
+                  </p>
+                )}
                 <div className="flex gap-4">
                   <Button variant="outline" onClick={runDryRun} className="flex-1 h-14">
                     SIMULATE
                   </Button>
                   <Button
                     onClick={execute}
-                    disabled={executing || !accountConnected}
+                    disabled={executing || !accountConnected || !canSponsor}
                     className="flex-1 h-14 bg-white text-black hover:bg-skitty-accent hover:text-white"
+                    title={!canSponsor ? 'Rebate does not cover gas + fee' : undefined}
                   >
                     {executing ? 'PURGING...' : 'EXECUTE PURGE'}
                   </Button>

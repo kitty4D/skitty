@@ -11,6 +11,7 @@ react app that lets you connect your wallet (or paste any sui address) and scan 
 - **dry run** - simulates the tx before you sign so you see net SUI gain vs gas.
 - **feed skitty** - when viewing the raw simulation, you can have skitty (powered by Gemini) explain the txn in plain language. rate limited per minute and per day so the cat doesn’t get exhausted.
 - **eats a small fee** - for now it takes a 13.69% fee, since the amounts are so smol as it is.
+- **gas sponsor** - the wallet that receives fees, sponsors the gas. this allows a wallet w no sui to burn and get sui.
 
 
 ## tech stack

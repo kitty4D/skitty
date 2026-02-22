@@ -2,6 +2,7 @@ import * as React from 'react';
 import { graphQLClient } from './graphql/client';
 import { rpcClient } from './rpcClient';
 import { REBATE_MULTIPLIER, ESTIMATED_GAS, isProtectedType } from './constants';
+import { computeFeeMist } from './buildCleanupTransaction';
 import type {
   CleanupAction,
   MergeCoinsAction,
@@ -12,7 +13,7 @@ import type {
   ScanProgress,
 } from './types';
 import { KNOWN_BURNABLE } from './constants';
-import { getCoinTypeArg, getWalletCoinBlocklist } from './walletBlocklist';
+import { getCoinTypeArg, getWalletCoinBlocklist, getWalletObjectBlocklist } from './walletBlocklist';
 import type { SuiMoveNormalizedModule, SuiObjectData } from '@mysten/sui/jsonRpc';
 
 const COIN_TYPE_PREFIX = '0x2::coin::Coin<';
@@ -241,6 +242,8 @@ async function findCoinActionsByGraphQL(
       const typeArg = getCoinTypeArg(coinType);
       if (blocklist.has(typeArg)) continue;
       const userRebateMist = Math.floor(group.storageRebateTotal * REBATE_MULTIPLIER);
+      const feeMist = computeFeeMist(group.storageRebateTotal);
+      if (userRebateMist < estMerge + feeMist) continue;
       const label = typeArg.indexOf('::') !== -1 ? typeArg.slice(typeArg.indexOf('::') + 2) : typeArg;
       mergeActions.push({
         kind: 'merge_coins',
@@ -251,7 +254,7 @@ async function findCoinActionsByGraphQL(
         storageRebateTotal: String(group.storageRebateTotal),
         userRebateMist,
         estimatedGasMist: estMerge,
-        netGainMist: userRebateMist - estMerge,
+        netGainMist: userRebateMist - estMerge - feeMist,
       });
     }
 
@@ -261,6 +264,8 @@ async function findCoinActionsByGraphQL(
       const typeArg = getCoinTypeArg(z.coinType);
       if (blocklist.has(typeArg)) continue;
       const userRebateMist = Math.floor(z.storageRebate * REBATE_MULTIPLIER);
+      const feeMist = computeFeeMist(z.storageRebate);
+      if (userRebateMist < estZero + feeMist) continue;
       const label = typeArg.indexOf('::') !== -1 ? typeArg.slice(typeArg.indexOf('::') + 2) : typeArg;
       destroyZeroActions.push({
         kind: 'destroy_zero',
@@ -269,7 +274,7 @@ async function findCoinActionsByGraphQL(
         storageRebateTotal: String(z.storageRebate),
         userRebateMist,
         estimatedGasMist: estZero,
-        netGainMist: userRebateMist - estZero,
+        netGainMist: userRebateMist - estZero - feeMist,
         label,
       });
     }
@@ -320,6 +325,8 @@ async function findEmptyKiosksByGraphQL(
     updateProgress({ phase: 'checking kiosks', current: 0, total: kioskCaps.length });
     const est = ESTIMATED_GAS.closeKiosk;
     const closeActions: CloseKioskAction[] = [];
+    const objectBlocklist = await getWalletObjectBlocklist();
+    if (objectBlocklist.has(KIOSK_TYPE)) return closeActions;
     let current = 0;
 
     for (const cap of kioskCaps) {
@@ -331,6 +338,8 @@ async function findEmptyKiosksByGraphQL(
       if (!(await isKioskEmptyByGraphQL(kioskId))) continue;
       const storageRebateTotal = Number(cap.storageRebate ?? 0);
       const userRebateMist = Math.floor(storageRebateTotal * REBATE_MULTIPLIER);
+      const feeMist = computeFeeMist(storageRebateTotal);
+      if (userRebateMist < est + feeMist) continue;
       closeActions.push({
         kind: 'close_kiosk',
         kioskId,
@@ -340,7 +349,7 @@ async function findEmptyKiosksByGraphQL(
         storageRebateTotal: String(storageRebateTotal),
         userRebateMist,
         estimatedGasMist: est,
-        netGainMist: userRebateMist - est,
+        netGainMist: userRebateMist - est - feeMist,
       });
     }
     return closeActions;
@@ -510,11 +519,13 @@ async function findBurnableObjectsByRPC(
     const burnActions: BurnAction[] = [];
     const est = ESTIMATED_GAS.burn;
     const types = [...byType.keys()];
+    const objectBlocklist = await getWalletObjectBlocklist();
     updateProgress({ phase: 'discovering burn', current: 0, total: types.length });
 
     for (let i = 0; i < types.length; i++) {
       updateProgress({ phase: 'discovering burn', current: i + 1, total: types.length });
       const objectType = types[i];
+      if (objectBlocklist.has(objectType)) continue;
       const list = byType.get(objectType)!;
       let moveTarget: string | null = null;
       let discovered = false;
@@ -545,6 +556,9 @@ async function findBurnableObjectsByRPC(
         0
       );
       const userRebateMist = Math.floor(storageRebateTotal * REBATE_MULTIPLIER);
+      const feeMist = computeFeeMist(storageRebateTotal);
+      const gasEst = est * list.length;
+      if (userRebateMist < gasEst + feeMist) continue;
       const shortType = objectType.slice(objectType.indexOf('::') + 2) || objectType;
       burnActions.push({
         kind: 'burn',
@@ -554,8 +568,8 @@ async function findBurnableObjectsByRPC(
         objectIds,
         storageRebateTotal: String(storageRebateTotal),
         userRebateMist,
-        estimatedGasMist: est * list.length,
-        netGainMist: userRebateMist - est * list.length,
+        estimatedGasMist: gasEst,
+        netGainMist: userRebateMist - gasEst - feeMist,
         label: shortType,
       });
     }

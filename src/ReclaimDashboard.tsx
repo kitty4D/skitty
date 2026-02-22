@@ -1,17 +1,17 @@
 import * as React from 'react';
 import {
   useCurrentAccount,
-  useSignAndExecuteTransaction,
+  useSignTransaction,
   ConnectButton as KitConnectButton,
 } from '@mysten/dapp-kit';
 import { useGraphQLScanner } from './useGraphQLScanner';
 import { buildBatchTransaction } from './buildCleanupTransaction';
-import { REBATE_MULTIPLIER, DRY_RUN_GAS_BUDGET } from './constants';
+import { REBATE_MULTIPLIER, FEE_RECIPIENT } from './constants';
 import { computeFeeMist } from './buildCleanupTransaction';
 import { rpcClient } from './rpcClient';
 import type { CleanupAction } from './types';
 
-// UI components
+// ui components
 import { Button } from './components/ui/button';
 import { Input } from './components/ui/input';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from './components/ui/card';
@@ -19,7 +19,7 @@ import { Alert, AlertDescription } from './components/ui/alert';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from './utils/cn';
 import { X } from 'lucide-react';
-import { formatSui, bytesToBase64, shortLabelFromType, shortenAddress } from './utils/format';
+import { formatSui, bytesToBase64, base64ToBytes, shortLabelFromType, shortenAddress } from './utils/format';
 import { canRequestExplain, recordExplainRequest } from './utils/explain';
 import { ScanProgressPanel } from './components/ScanProgressPanel';
 import { WarningsBlock } from './components/WarningsBlock';
@@ -49,12 +49,13 @@ const itemVariants = {
   },
 };
 
+import { Transaction } from '@mysten/sui/transactions';
 import { graphQLClient } from './graphql/client';
 import { isSuiNSDomain, resolveSuiNSDomain } from './utils/suiNS';
 
 export function ReclaimDashboard() {
   const account = useCurrentAccount();
-  const { mutateAsync: signAndExecute } = useSignAndExecuteTransaction();
+  const { mutateAsync: signTransaction } = useSignTransaction();
 
   const [manualAddress, setManualAddress] = React.useState('');
   const [resolvedAddress, setResolvedAddress] = React.useState<string | null>(null);
@@ -97,16 +98,15 @@ export function ReclaimDashboard() {
   }, [rawInput]);
 
   const [executeError, setExecuteError] = React.useState<string | null>(null);
+  const [lastSponsorImpact, setLastSponsorImpact] = React.useState<{
+    digest: string;
+    netMist: number;
+  } | null>(null);
 
   // cart minimized state
   const [isCartMinimized, setIsCartMinimized] = React.useState(false);
 
-  // gas coin (for gas only); fee coin (for fee split, must be different from gas)
-  const [gasCoinId, setGasCoinId] = React.useState<string | null>(null);
-  const [feeCoinId, setFeeCoinId] = React.useState<string | null>(null);
-
   const { state, scan, refreshAfterExecute } = useGraphQLScanner(addressToUse);
-  const gasOwnerAddress = account?.address ?? state.scannedAddress ?? null;
 
   // when user hit submit with SuiNS before resolve finished, run scan once address is ready
   React.useEffect(() => {
@@ -115,36 +115,6 @@ export function ReclaimDashboard() {
       scan();
     }
   }, [addressToUse, state.loading, scan]);
-
-  React.useEffect(() => {
-    const fetchCoins = async () => {
-      if (!gasOwnerAddress) {
-        setGasCoinId(null);
-        setFeeCoinId(null);
-        return;
-      }
-      try {
-        const res = await rpcClient.getCoins({
-          owner: gasOwnerAddress,
-          coinType: '0x2::sui::SUI',
-          limit: 10,
-        });
-        const list = res.data ?? [];
-        if (list.length > 0) {
-          setGasCoinId(list[0].coinObjectId);
-          setFeeCoinId(list.length > 1 ? list[1].coinObjectId : null);
-        } else {
-          setGasCoinId(null);
-          setFeeCoinId(null);
-        }
-      } catch (error) {
-        console.error('Error fetching coins:', error);
-        setGasCoinId(null);
-        setFeeCoinId(null);
-      }
-    };
-    fetchCoins();
-  }, [gasOwnerAddress]);
 
   // start that scan immediately when user connects wallet!
   const prevAccountAddress = React.useRef<string | undefined>(undefined);
@@ -163,14 +133,14 @@ export function ReclaimDashboard() {
     error?: string;
   } | null>(null);
   const [simulationModal, setSimulationModal] = React.useState<{
-    /** Net gain from formula (rebate - gas - fee); used when balance changes unavailable */
+    /** net gain from formula (rebate - gas - fee); used when balance changes unavailable */
     netGainMist?: number;
-    /** Actual SUI balance change for sender from simulation (preferred for display) */
+    /** actual SUI balance change for sender from simulation (preferred for display) */
     netInflowMist?: number;
     gasCostMist?: number;
     error?: string;
   } | null>(null);
-  /** Per-action simulated net inflow (from balance changes); card shows this when set so it matches wallet */
+  /** per-action simulated net inflow (from balance changes); card shows this when set so it matches wallet */
   const [simulatedNetInflowByIndex, setSimulatedNetInflowByIndex] = React.useState<Record<number, number>>({});
   const [lastDryRunRawJson, setLastDryRunRawJson] = React.useState<string | null>(null);
   const [showRawSimulation, setShowRawSimulation] = React.useState(false);
@@ -194,8 +164,10 @@ export function ReclaimDashboard() {
     (s, a) => s + Number(a.storageRebateTotal),
     0
   );
+  const totalEstimatedGasMist = selectedActionList.reduce((s, a) => s + a.estimatedGasMist, 0);
   const burnedMist = Math.floor(totalStorageRebateMist * (1 - REBATE_MULTIPLIER));
   const feeMist = computeFeeMist(totalStorageRebateMist);
+  const canSponsorBatch = totalSelectedRebateMist >= totalEstimatedGasMist + feeMist;
 
   const runDryRun = React.useCallback(async () => {
     if (selectedActionList.length === 0) {
@@ -206,69 +178,52 @@ export function ReclaimDashboard() {
       setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: 'Connect wallet to dry run.' });
       return;
     }
-    if (!gasCoinId) {
-      setDryRunResult({
-        netGainMist: 0,
-        gasCostMist: 0,
-        error: 'Need at least one SUI coin object (any amount) to estimate gas (dry run).',
-      });
-      return;
-    }
     setDryRunResult(null);
     try {
-      const tx = buildBatchTransaction(selectedActionList, gasCoinId, totalStorageRebateMist, feeCoinId);
+      const estimatedGasMist = selectedActionList.reduce((s, a) => s + a.estimatedGasMist, 0);
+      const tx = buildBatchTransaction(
+        selectedActionList,
+        null,
+        totalStorageRebateMist,
+        null,
+        estimatedGasMist,
+        null,
+        { sponsoredGas: true, senderAddress: account.address }
+      );
       tx.setSender(account.address);
+      tx.setGasOwner(FEE_RECIPIENT);
+      const kindBytes = await tx.build({ client: graphQLClient, onlyTransactionKind: true });
+      const txBytesBase64 = bytesToBase64(kindBytes instanceof Uint8Array ? kindBytes : new Uint8Array(kindBytes));
 
-      // pre-set gas so the GraphQL resolver skips gas selection (fails when balance is low otherwise)
-      const gasObj = await rpcClient.getObject({ id: gasCoinId });
-      if (gasObj.error || !gasObj.data) {
-        setDryRunResult({
-          netGainMist: 0,
-          gasCostMist: 0,
-          error: 'Could not load gas coin for dry run.',
-        });
-        return;
-      }
-      const { objectId, version, digest } = gasObj.data;
-      tx.setGasPayment([{ objectId, version, digest }]);
-      // budget can't be bigger than coin balance or backend rejects transaction, v sad(
-      const coins = await rpcClient.getCoins({
-        owner: account.address,
-        coinType: '0x2::sui::SUI',
-        limit: 100,
+      const sponsorRes = await fetch('/api/sponsor', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ txBytes: txBytesBase64, userAddress: account.address }),
       });
-      const gasCoin = coins.data?.find((c) => c.coinObjectId === gasCoinId);
-      const gasBalanceMist = gasCoin ? BigInt(gasCoin.balance) : 0n;
-      if (gasBalanceMist === 0n) {
-        setDryRunResult({
-          netGainMist: 0,
-          gasCostMist: 0,
-          error: 'Gas coin has zero balance; cannot run dry run.',
-        });
-        return;
+      if (!sponsorRes.ok) {
+        const err = await sponsorRes.json().catch(() => ({}));
+        throw new Error(err?.error ?? `Sponsor API ${sponsorRes.status}`);
       }
-      const budget = gasBalanceMist < BigInt(DRY_RUN_GAS_BUDGET) ? String(gasBalanceMist) : String(DRY_RUN_GAS_BUDGET);
-      tx.setGasBudget(budget);
+      const { sponsoredTxBytes } = await sponsorRes.json();
+      if (!sponsoredTxBytes) throw new Error('Invalid sponsor response');
 
-      let transactionJson: string | null = null;
-      try {
-        transactionJson = await tx.toJSON({ client: graphQLClient });
-      } catch (_) {
-        // toJSON can fail if tx has unresolved refs; we still have bytes below
-      }
-      const txBytes = await tx.build({ client: graphQLClient });
+      const sponsoredBytes = base64ToBytes(sponsoredTxBytes);
       const result = await graphQLClient.simulateTransaction({
-        transaction: txBytes,
+        transaction: sponsoredBytes,
         include: { effects: true },
       });
-      const requestPayload = {
-        transaction: transactionJson != null ? JSON.parse(transactionJson) : null,
-        transactionBytesBase64: bytesToBase64(txBytes instanceof Uint8Array ? txBytes : new Uint8Array(txBytes)),
-        include: { effects: true },
-      };
       setGeminiExplanation(null);
       setGeminiError(null);
-      setLastDryRunRawJson(JSON.stringify({ request: requestPayload, response: result }, null, 2));
+      setLastDryRunRawJson(
+        JSON.stringify(
+          {
+            request: { transactionBytesBase64: sponsoredTxBytes, include: { effects: true } },
+            response: result,
+          },
+          null,
+          2
+        )
+      );
       const effects =
         result.$kind === 'Transaction' ? result.Transaction.effects : result.FailedTransaction?.effects;
       if (!effects) {
@@ -293,52 +248,131 @@ export function ReclaimDashboard() {
         error: errMsg,
       });
     }
-  }, [account?.address, selectedActionList, totalSelectedRebateMist, totalStorageRebateMist, feeMist, gasCoinId, feeCoinId]);
+  }, [account?.address, selectedActionList, totalSelectedRebateMist, totalStorageRebateMist, feeMist]);
 
   const execute = React.useCallback(async () => {
     if (selectedActionList.length === 0 || !account?.address) return;
-    const gasId = gasCoinId;
-    if (!gasId) {
-      setExecuteError('No valid gas coins found for the transaction.');
-      return;
-    }
     setExecuting(true);
     setExecuteError(null);
+    setLastSponsorImpact(null);
     const clearExecuting = () => setExecuting(false);
     const safetyTimeoutId = setTimeout(clearExecuting, 120_000);
     try {
-      const tx = buildBatchTransaction(selectedActionList, gasId, totalStorageRebateMist, feeCoinId);
-      tx.setSender(account.address);
-      const gasObj = await rpcClient.getObject({ id: gasId });
-      if (gasObj.error || !gasObj.data) {
-        setExecuteError('Could not load gas coin.');
-        return;
-      }
-      const { objectId, version, digest } = gasObj.data;
-      tx.setGasPayment([{ objectId, version, digest }]);
-      const coinsRes = await rpcClient.getCoins({
-        owner: account.address,
-        coinType: '0x2::sui::SUI',
-        limit: 100,
+      const estimatedGasMist = selectedActionList.reduce((s, a) => s + a.estimatedGasMist, 0);
+      // 1) Build with estimated gas, sponsor, dry run to get actual gas cost
+      const txDraft = buildBatchTransaction(
+        selectedActionList,
+        null,
+        totalStorageRebateMist,
+        null,
+        estimatedGasMist,
+        null,
+        { sponsoredGas: true, senderAddress: account.address }
+      );
+      txDraft.setSender(account.address);
+      txDraft.setGasOwner(FEE_RECIPIENT);
+      const kindBytesDraft = await txDraft.build({ client: graphQLClient, onlyTransactionKind: true });
+      const txBytesBase64Draft = bytesToBase64(kindBytesDraft instanceof Uint8Array ? kindBytesDraft : new Uint8Array(kindBytesDraft));
+
+      const sponsorRes1 = await fetch('/api/sponsor', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ txBytes: txBytesBase64Draft, userAddress: account.address }),
       });
-      const gasCoin = (coinsRes.data ?? []).find((c) => c.coinObjectId === gasId);
-      const gasBalanceMist = gasCoin ? BigInt(gasCoin.balance) : 0n;
-      if (gasBalanceMist === 0n) {
-        setExecuteError('Gas coin has zero balance.');
+      if (!sponsorRes1.ok) {
+        const err = await sponsorRes1.json().catch(() => ({}));
+        throw new Error(err?.error ?? `Sponsor API ${sponsorRes1.status}`);
+      }
+      const { sponsoredTxBytes: sponsoredDraft } = await sponsorRes1.json();
+      if (!sponsoredDraft) throw new Error('Invalid sponsor response');
+
+      const simResult = await graphQLClient.simulateTransaction({
+        transaction: base64ToBytes(sponsoredDraft),
+        include: { effects: true },
+      });
+      const simEffects = (simResult.$kind === 'Transaction' ? simResult.Transaction : simResult.FailedTransaction)?.effects;
+      if (!simEffects?.gasUsed) throw new Error('Dry run failed or no gas data');
+      const gasCostMist =
+        Number(simEffects.gasUsed?.computationCost ?? 0) +
+        Number(simEffects.gasUsed?.storageCost ?? 0) -
+        Number(simEffects.gasUsed?.storageRebate ?? 0);
+      const gasRecoupMist =
+        gasCostMist > 0 ? gasCostMist : estimatedGasMist;
+      if (totalSelectedRebateMist < gasRecoupMist + feeMist) {
+        setExecuteError(
+          'Selected actions don\'t cover gas and fee (simulation showed gas cost higher than rebate). We don\'t sponsor losing transactions.'
+        );
         return;
       }
-      const budget = gasBalanceMist < BigInt(DRY_RUN_GAS_BUDGET) ? String(gasBalanceMist) : String(DRY_RUN_GAS_BUDGET);
-      tx.setGasBudget(budget);
-      const result = await signAndExecute({ transaction: tx });
+
+      // 2) Rebuild with actual gas so we recoup what we spend (fallback to estimate when sim says <= 0)
+      const tx = buildBatchTransaction(
+        selectedActionList,
+        null,
+        totalStorageRebateMist,
+        null,
+        gasRecoupMist,
+        null,
+        { sponsoredGas: true, senderAddress: account.address }
+      );
+      tx.setSender(account.address);
+      tx.setGasOwner(FEE_RECIPIENT);
+      const kindBytes = await tx.build({ client: graphQLClient, onlyTransactionKind: true });
+      const txBytesBase64 = bytesToBase64(kindBytes instanceof Uint8Array ? kindBytes : new Uint8Array(kindBytes));
+
+      const sponsorRes = await fetch('/api/sponsor', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ txBytes: txBytesBase64, userAddress: account.address }),
+      });
+      if (!sponsorRes.ok) {
+        const err = await sponsorRes.json().catch(() => ({}));
+        throw new Error(err?.error ?? `Sponsor API ${sponsorRes.status}`);
+      }
+      const { sponsoredTxBytes, sponsorSignature } = await sponsorRes.json();
+      if (!sponsoredTxBytes || !sponsorSignature) throw new Error('Invalid sponsor response');
+
+      const txToSign = Transaction.from(sponsoredTxBytes);
+      const { bytes: signedTxBytes, signature: userSignature } = await signTransaction({
+        transaction: txToSign,
+      });
+
+      const result = await rpcClient.executeTransactionBlock({
+        transactionBlock: signedTxBytes,
+        signature: [sponsorSignature, userSignature],
+        options: { showEffects: true },
+      });
       setDryRunResult(null);
       const executedActions = [...selectedActionList];
       setSelectedActions(new Set());
-      if (result?.digest) {
+      if (result.digest) {
         await rpcClient.waitForTransaction({
           digest: result.digest,
           timeout: 30_000,
           pollInterval: 500,
         });
+        try {
+          const txResp = await rpcClient.getTransactionBlock({
+            digest: result.digest,
+            options: { showBalanceChanges: true },
+          });
+          const changes = txResp.balanceChanges ?? [];
+          const sponsorNorm = FEE_RECIPIENT.toLowerCase();
+          const ownerAddr = (o: typeof changes[0]['owner']) =>
+            o && typeof o === 'object' && 'AddressOwner' in o ? (o as { AddressOwner: string }).AddressOwner : null;
+          const isSui = (t: string) => t != null && /^0x0*2::sui::sui$/i.test(t.replace(/^0x0+/, '0x'));
+          let netMist = 0;
+          for (const ch of changes) {
+            const addr = ownerAddr(ch.owner);
+            if (addr?.toLowerCase() === sponsorNorm && isSui(ch.coinType)) {
+              const amt = Number(ch.amount);
+              if (!Number.isNaN(amt)) netMist += amt;
+            }
+          }
+          setLastSponsorImpact({ digest: result.digest, netMist });
+        } catch {
+          setLastSponsorImpact(null);
+        }
       }
       await refreshAfterExecute(executedActions);
       setSimulatedNetInflowByIndex({});
@@ -349,7 +383,7 @@ export function ReclaimDashboard() {
       clearTimeout(safetyTimeoutId);
       clearExecuting();
     }
-  }, [account?.address, selectedActionList, signAndExecute, refreshAfterExecute, gasCoinId, feeCoinId]);
+  }, [account?.address, selectedActionList, signTransaction, refreshAfterExecute, totalStorageRebateMist]);
 
   const runDryRunOne = React.useCallback(
     async (action: CleanupAction, actionIndex: number) => {
@@ -358,68 +392,53 @@ export function ReclaimDashboard() {
         setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: 'Scan an address or connect wallet to run simulation.' });
         return;
       }
-      if (!gasCoinId) {
-        setDryRunResult({
-          netGainMist: 0,
-          gasCostMist: 0,
-          error: 'Need at least one SUI coin object (any amount) to estimate gas (dry run).',
-        });
-        return;
-      }
       setDryRunResult(null);
       try {
         const singleStorageRebate = Number(action.storageRebateTotal);
-        const tx = buildBatchTransaction([action], gasCoinId, singleStorageRebate, feeCoinId);
+        console.debug('[Skitty simulate one]', { senderAddress, singleStorageRebate });
+        const tx = buildBatchTransaction(
+          [action],
+          null,
+          singleStorageRebate,
+          null,
+          action.estimatedGasMist,
+          null,
+          { sponsoredGas: true, senderAddress }
+        );
         tx.setSender(senderAddress);
+        tx.setGasOwner(FEE_RECIPIENT);
+        const kindBytes = await tx.build({ client: graphQLClient, onlyTransactionKind: true });
+        const txBytesBase64 = bytesToBase64(kindBytes instanceof Uint8Array ? kindBytes : new Uint8Array(kindBytes));
 
-        const gasObj = await rpcClient.getObject({ id: gasCoinId });
-        if (gasObj.error || !gasObj.data) {
-          setDryRunResult({
-            netGainMist: 0,
-            gasCostMist: 0,
-            error: 'Could not load gas coin for dry run.',
-          });
-          return;
-        }
-        const { objectId, version, digest } = gasObj.data;
-        tx.setGasPayment([{ objectId, version, digest }]);
-        const coins = await rpcClient.getCoins({
-          owner: senderAddress,
-          coinType: '0x2::sui::SUI',
-          limit: 100,
+        const sponsorRes = await fetch('/api/sponsor', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ txBytes: txBytesBase64, userAddress: senderAddress }),
         });
-        const gasCoin = coins.data?.find((c) => c.coinObjectId === gasCoinId);
-        const gasBalanceMist = gasCoin ? BigInt(gasCoin.balance) : 0n;
-        if (gasBalanceMist === 0n) {
-          setDryRunResult({
-            netGainMist: 0,
-            gasCostMist: 0,
-            error: 'Gas coin has zero balance; cannot run dry run.',
-          });
-          return;
+        if (!sponsorRes.ok) {
+          const err = await sponsorRes.json().catch(() => ({}));
+          throw new Error(err?.error ?? `Sponsor API ${sponsorRes.status}`);
         }
-        const budget = gasBalanceMist < BigInt(DRY_RUN_GAS_BUDGET) ? String(gasBalanceMist) : String(DRY_RUN_GAS_BUDGET);
-        tx.setGasBudget(budget);
+        const { sponsoredTxBytes } = await sponsorRes.json();
+        if (!sponsoredTxBytes) throw new Error('Invalid sponsor response');
 
-        let transactionJson: string | null = null;
-        try {
-          transactionJson = await tx.toJSON({ client: graphQLClient });
-        } catch (_) {
-          // toJSON can fail if tx has unresolved refs; we still have bytes below
-        }
-        const txBytes = await tx.build({ client: graphQLClient });
+        const sponsoredBytes = base64ToBytes(sponsoredTxBytes);
         const result = await graphQLClient.simulateTransaction({
-          transaction: txBytes,
+          transaction: sponsoredBytes,
           include: { effects: true, balanceChanges: true },
         });
-        const requestPayload = {
-          transaction: transactionJson != null ? JSON.parse(transactionJson) : null,
-          transactionBytesBase64: bytesToBase64(txBytes instanceof Uint8Array ? txBytes : new Uint8Array(txBytes)),
-          include: { effects: true, balanceChanges: true },
-        };
         setGeminiExplanation(null);
         setGeminiError(null);
-        setLastDryRunRawJson(JSON.stringify({ request: requestPayload, response: result }, null, 2));
+        setLastDryRunRawJson(
+          JSON.stringify(
+            {
+              request: { transactionBytesBase64: sponsoredTxBytes, include: { effects: true, balanceChanges: true } },
+              response: result,
+            },
+            null,
+            2
+          )
+        );
         const txResult = result.$kind === 'Transaction' ? result.Transaction : result.FailedTransaction;
         const effects = txResult?.effects;
         if (!effects) {
@@ -438,15 +457,16 @@ export function ReclaimDashboard() {
         const balanceChanges = txResult.balanceChanges;
         if (balanceChanges && senderAddress) {
           const senderNorm = senderAddress.toLowerCase();
-          const suiTypeLower = '0x2::sui::sui';
+          // SUI type can be 0x2::sui::SUI or long form 0x0...02::sui::SUI
+          const isSuiCoinType = (t: string | undefined) =>
+            t != null && /^0x0*2::sui::sui$/i.test(t.replace(/^0x0+/, '0x'));
           for (const ch of balanceChanges) {
-            if (ch.address?.toLowerCase() === senderNorm && ch.coinType?.toLowerCase() === suiTypeLower) {
+            if (ch.address?.toLowerCase() === senderNorm && isSuiCoinType(ch.coinType)) {
               const amount = Number(ch.amount);
               if (!Number.isNaN(amount)) netInflowMist = (netInflowMist ?? 0) + amount;
             }
           }
         }
-        // Wallet "expected coin inflow" matches the gas credit when gas cost is negative (rebate > gas spent)
         const expectedInflowMist =
           netInflowMist ?? (gasCostMist <= 0 ? -gasCostMist : undefined) ?? netGainMist;
         setDryRunResult({ netGainMist, gasCostMist, error: undefined });
@@ -459,6 +479,7 @@ export function ReclaimDashboard() {
         setSimulatedNetInflowByIndex((prev) => ({ ...prev, [actionIndex]: expectedInflowMist }));
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e);
+        console.debug('[Skitty simulate one] failed:', errMsg, e);
         setGeminiExplanation(null);
         setGeminiError(null);
         setLastDryRunRawJson(JSON.stringify({ request: null, response: { error: errMsg } }, null, 2));
@@ -466,10 +487,10 @@ export function ReclaimDashboard() {
         setSimulationModal({ error: errMsg });
       }
     },
-    [account?.address, state.scannedAddress, gasCoinId, feeCoinId]
+    [account?.address, state.scannedAddress]
   );
 
-  // Clear simulated yields when scan results change so we don't show stale numbers
+  // clear simulated yields when scan results change so we don't show stale numbers
   React.useEffect(() => {
     setSimulatedNetInflowByIndex({});
   }, [state.scannedAddress, state.actions.length]);
@@ -477,48 +498,128 @@ export function ReclaimDashboard() {
   const executeOne = React.useCallback(
     async (action: CleanupAction) => {
       if (!account?.address) return;
-      if (!gasCoinId) {
-        setExecuteError('No valid gas coins found for the transaction.');
-        return;
-      }
       setExecuting(true);
       setExecuteError(null);
+      setLastSponsorImpact(null);
       const clearExecuting = () => setExecuting(false);
       const safetyTimeoutId = setTimeout(clearExecuting, 120_000);
       try {
         const singleStorageRebate = Number(action.storageRebateTotal);
-        const tx = buildBatchTransaction([action], gasCoinId, singleStorageRebate, feeCoinId);
-        tx.setSender(account.address);
-        const gasObj = await rpcClient.getObject({ id: gasCoinId });
-        if (gasObj.error || !gasObj.data) {
-          setExecuteError('Could not load gas coin.');
-          return;
-        }
-        const { objectId, version, digest } = gasObj.data;
-        tx.setGasPayment([{ objectId, version, digest }]);
-        const coinsRes = await rpcClient.getCoins({
-          owner: account.address,
-          coinType: '0x2::sui::SUI',
-          limit: 100,
+        // 1) Build with estimated gas, sponsor, dry run to get actual gas cost
+        const txDraft = buildBatchTransaction(
+          [action],
+          null,
+          singleStorageRebate,
+          null,
+          action.estimatedGasMist,
+          null,
+          { sponsoredGas: true, senderAddress: account.address }
+        );
+        txDraft.setSender(account.address);
+        txDraft.setGasOwner(FEE_RECIPIENT);
+        const kindBytesDraft = await txDraft.build({ client: graphQLClient, onlyTransactionKind: true });
+        const txBytesBase64Draft = bytesToBase64(kindBytesDraft instanceof Uint8Array ? kindBytesDraft : new Uint8Array(kindBytesDraft));
+
+        const sponsorRes1 = await fetch('/api/sponsor', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ txBytes: txBytesBase64Draft, userAddress: account.address }),
         });
-        const gasCoin = (coinsRes.data ?? []).find((c) => c.coinObjectId === gasCoinId);
-        const gasBalanceMist = gasCoin ? BigInt(gasCoin.balance) : 0n;
-        if (gasBalanceMist === 0n) {
-          setExecuteError('Gas coin has zero balance.');
+        if (!sponsorRes1.ok) {
+          const err = await sponsorRes1.json().catch(() => ({}));
+          throw new Error(err?.error ?? `Sponsor API ${sponsorRes1.status}`);
+        }
+        const { sponsoredTxBytes: sponsoredDraft } = await sponsorRes1.json();
+        if (!sponsoredDraft) throw new Error('Invalid sponsor response');
+
+        const simResult = await graphQLClient.simulateTransaction({
+          transaction: base64ToBytes(sponsoredDraft),
+          include: { effects: true },
+        });
+        const simEffects = (simResult.$kind === 'Transaction' ? simResult.Transaction : simResult.FailedTransaction)?.effects;
+        if (!simEffects?.gasUsed) throw new Error('Dry run failed or no gas data');
+        const gasCostMist =
+          Number(simEffects.gasUsed?.computationCost ?? 0) +
+          Number(simEffects.gasUsed?.storageCost ?? 0) -
+          Number(simEffects.gasUsed?.storageRebate ?? 0);
+        const gasRecoupMist =
+          gasCostMist > 0 ? gasCostMist : action.estimatedGasMist;
+        const singleFeeMist = computeFeeMist(singleStorageRebate);
+        if (action.userRebateMist < gasRecoupMist + singleFeeMist) {
+          setExecuteError(
+            'This action doesn\'t cover gas and fee (simulation showed gas cost higher than rebate). We don\'t sponsor losing transactions.'
+          );
           return;
         }
-        const budget = gasBalanceMist < BigInt(DRY_RUN_GAS_BUDGET) ? String(gasBalanceMist) : String(DRY_RUN_GAS_BUDGET);
-        tx.setGasBudget(budget);
-        const result = await signAndExecute({ transaction: tx });
+
+        // 2) Rebuild with actual gas so we recoup what we spend (fallback to estimate when sim says <= 0)
+        const tx = buildBatchTransaction(
+          [action],
+          null,
+          singleStorageRebate,
+          null,
+          gasRecoupMist,
+          null,
+          { sponsoredGas: true, senderAddress: account.address }
+        );
+        tx.setSender(account.address);
+        tx.setGasOwner(FEE_RECIPIENT);
+        const kindBytes = await tx.build({ client: graphQLClient, onlyTransactionKind: true });
+        const txBytesBase64 = bytesToBase64(kindBytes instanceof Uint8Array ? kindBytes : new Uint8Array(kindBytes));
+
+        const sponsorRes = await fetch('/api/sponsor', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ txBytes: txBytesBase64, userAddress: account.address }),
+        });
+        if (!sponsorRes.ok) {
+          const err = await sponsorRes.json().catch(() => ({}));
+          throw new Error(err?.error ?? `Sponsor API ${sponsorRes.status}`);
+        }
+        const { sponsoredTxBytes, sponsorSignature } = await sponsorRes.json();
+        if (!sponsoredTxBytes || !sponsorSignature) throw new Error('Invalid sponsor response');
+
+        const txToSign = Transaction.from(sponsoredTxBytes);
+        const { bytes: signedTxBytes, signature: userSignature } = await signTransaction({
+          transaction: txToSign,
+        });
+
+        const result = await rpcClient.executeTransactionBlock({
+          transactionBlock: signedTxBytes,
+          signature: [sponsorSignature, userSignature],
+          options: { showEffects: true },
+        });
         setDryRunResult(null);
         const executedActions = [action];
         setSelectedActions(new Set());
-        if (result?.digest) {
+        if (result.digest) {
           await rpcClient.waitForTransaction({
             digest: result.digest,
             timeout: 30_000,
             pollInterval: 500,
           });
+          try {
+            const txResp = await rpcClient.getTransactionBlock({
+              digest: result.digest,
+              options: { showBalanceChanges: true },
+            });
+            const changes = txResp.balanceChanges ?? [];
+            const sponsorNorm = FEE_RECIPIENT.toLowerCase();
+            const ownerAddr = (o: typeof changes[0]['owner']) =>
+              o && typeof o === 'object' && 'AddressOwner' in o ? (o as { AddressOwner: string }).AddressOwner : null;
+            const isSui = (t: string) => t != null && /^0x0*2::sui::sui$/i.test(t.replace(/^0x0+/, '0x'));
+            let netMist = 0;
+            for (const ch of changes) {
+              const addr = ownerAddr(ch.owner);
+              if (addr?.toLowerCase() === sponsorNorm && isSui(ch.coinType)) {
+                const amt = Number(ch.amount);
+                if (!Number.isNaN(amt)) netMist += amt;
+              }
+            }
+            setLastSponsorImpact({ digest: result.digest, netMist });
+          } catch {
+            setLastSponsorImpact(null);
+          }
         }
         await refreshAfterExecute(executedActions);
         setSimulatedNetInflowByIndex({});
@@ -530,7 +631,7 @@ export function ReclaimDashboard() {
         clearExecuting();
       }
     },
-    [account?.address, signAndExecute, refreshAfterExecute, gasCoinId, feeCoinId]
+    [account?.address, signTransaction, refreshAfterExecute]
   );
 
   const feedSkitty = React.useCallback(async () => {
@@ -655,6 +756,34 @@ export function ReclaimDashboard() {
           </div>
         </div>
       </header>
+
+      <AnimatePresence>
+        {lastSponsorImpact != null && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            className="mx-auto max-w-5xl px-6 py-2"
+          >
+            <div className="bg-white/10 border border-white/20 rounded-none p-3 flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">
+                Sponsor net last tx:{' '}
+                <span className={lastSponsorImpact.netMist >= 0 ? 'text-green-400' : 'text-red-400'}>
+                  {(lastSponsorImpact.netMist >= 0 ? '+' : '') + formatSui(lastSponsorImpact.netMist)} SUI
+                </span>
+              </span>
+              <a
+                href={`https://suivision.xyz/txblock/${lastSponsorImpact.digest}?tab=Changes`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-[10px] font-black text-skitty-accent hover:underline uppercase tracking-widest"
+              >
+                View changes →
+              </a>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <main className="mx-auto max-w-5xl px-6 py-12 space-y-12 pb-48">
         <motion.div
@@ -816,6 +945,10 @@ export function ReclaimDashboard() {
                           onDryRun={() => runDryRunOne(action, index)}
                           onExecute={() => executeOne(action)}
                           executing={executing}
+                          canSponsor={
+                            action.userRebateMist >=
+                            action.estimatedGasMist + computeFeeMist(Number(action.storageRebateTotal))
+                          }
                         />
                       ))}
                     </ul>
@@ -865,6 +998,8 @@ export function ReclaimDashboard() {
               onViewRawSimulation={() => setShowRawSimulation(true)}
               executing={executing}
               accountConnected={!!account?.address}
+              canSponsor={canSponsorBatch}
+              lastSponsorImpact={lastSponsorImpact}
               isMinimized={isCartMinimized}
               onToggleMinimize={() => setIsCartMinimized(!isCartMinimized)}
             />

@@ -16,14 +16,19 @@ export const FEE_RECIPIENT = '0x0154543c5e9d2db3b12d5b761b204b06620f35561b6065f5
 
 // gas budget for dry-run build; pre-set so GraphQL resolver skips gas selection (fails when balance low)
 export const DRY_RUN_GAS_BUDGET = 50_000_000;
+// when taking fee from gas coin, leave at least this much (mist) for gas so split doesn't fail
+export const GAS_RESERVE_FOR_FEE_MIST = 1_000_000;
 
 // estimated gas (mist) per action type for net-gain before dry run
 export const ESTIMATED_GAS = {
   mergeCoins: 500,
   destroyZero: 300,
   closeKiosk: 2000,
-  burn: 1500,
+  burn: 1_200_000,
 } as const;
+
+// when dry run returns gas cost <= 0, recoup up to this much so we don't lose (cap by user rebate - fee in code)
+export const RECOUP_FALLBACK_GAS_MIST = 1_500_000;
 
 // known burn/delete entry points: package::module::function
 export const KNOWN_BURNABLE: { typePattern: string; target: string }[] = [

@@ -2,6 +2,7 @@ import { motion } from 'framer-motion';
 import { FlaskConical, Trash2 } from 'lucide-react';
 import { Checkbox } from './ui/checkbox';
 import { cn } from '../utils/cn';
+import { computeFeeMist } from '../buildCleanupTransaction';
 import {
   formatSui,
   shortenAddress,
@@ -43,6 +44,7 @@ export function ActionCard({
   onDryRun,
   onExecute,
   executing,
+  canSponsor = true,
 }: {
   action: CleanupAction;
   index: number;
@@ -52,11 +54,13 @@ export function ActionCard({
   notEconomical?: boolean;
   interactive?: boolean;
   showSimulate?: boolean;
-  /** From simulation balance changes; when set, card shows this (matches wallet "you will receive") */
+  /** from simulation balance changes; when set, card shows this (matches wallet "you will receive") */
   simulatedNetInflowMist?: number;
   onDryRun: () => void;
   onExecute: () => void;
   executing: boolean;
+  /** false when rebate does not cover gas + fee; single-action execute disabled */
+  canSponsor?: boolean;
 }) {
   const isDiscovered = action.kind === 'burn' && (action as BurnAction).discovered;
   const isCoin = action.kind === 'merge_coins' || action.kind === 'destroy_zero';
@@ -170,12 +174,16 @@ export function ActionCard({
         <div className="shrink-0 flex flex-col gap-2 items-end min-w-[7rem]">
           <div className="text-right space-y-0.5">
             <p className="text-[10px] font-black text-skitty-secondary/40 tracking-widest">
-              {simulatedNetInflowMist !== undefined ? 'EST. NET YIELD' : 'RUN SIMULATE'}
+              EST. NET YIELD
             </p>
             <p className="text-sm font-black text-white leading-none tracking-tighter">
-              {simulatedNetInflowMist !== undefined
-                ? (simulatedNetInflowMist >= 0 ? '+' : '') + formatSui(simulatedNetInflowMist)
-                : '—'}
+              {(() => {
+                const valueMist =
+                  simulatedNetInflowMist !== undefined
+                    ? simulatedNetInflowMist
+                    : Math.max(0, action.userRebateMist - computeFeeMist(Number(action.storageRebateTotal)) - action.estimatedGasMist);
+                return (valueMist >= 0 ? '+' : '') + formatSui(valueMist);
+              })()}
             </p>
           </div>
 
@@ -199,16 +207,18 @@ export function ActionCard({
                     e.stopPropagation();
                     onExecute();
                   }}
-                  disabled={executing}
+                  disabled={executing || !canSponsor}
                   className="p-1.5 bg-black border border-white/10 hover:border-green-500 hover:text-green-500 transition-all disabled:opacity-20 shadow-[2px_2px_0_#000]"
                   title={
-                    action.kind === 'merge_coins'
-                      ? 'MERGE COIN'
-                      : action.kind === 'destroy_zero'
-                        ? 'DESTROY COIN'
-                        : action.kind === 'close_kiosk'
-                          ? 'CLOSE KIOSK'
-                          : 'ATTEMPT BURN'
+                    !canSponsor
+                      ? 'Rebate does not cover gas + fee'
+                      : action.kind === 'merge_coins'
+                        ? 'MERGE COIN'
+                        : action.kind === 'destroy_zero'
+                          ? 'DESTROY COIN'
+                          : action.kind === 'close_kiosk'
+                            ? 'CLOSE KIOSK'
+                            : 'ATTEMPT BURN'
                   }
                 >
                   <Trash2 className="h-3.5 w-3.5" />

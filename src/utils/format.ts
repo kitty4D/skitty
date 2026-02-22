@@ -4,6 +4,14 @@ export function formatSui(mist: number): string {
   return (mist / MIST_PER_SUI).toFixed(6);
 }
 
+// decode base64 to bytes (e.g. sponsored tx bytes from API)
+export function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 // encode bytes to base64 for raw simulation display
 export function bytesToBase64(bytes: Uint8Array): string {
   const chunk = 8192;
