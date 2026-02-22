@@ -31,7 +31,6 @@ export function buildBatchTransaction(
 
   // fee only when user gets something back. always take it from tx.gas at the end (rebates are applied to gas coin; we peel off our fee).
   let feeMist = computeFeeMist(totalStorageRebateMist);
-  const feeBeforeCap = feeMist;
   if (estimatedGasMist != null && feeMist > 0 && !sponsoredGas) {
     const userRebateMist = Math.floor(totalStorageRebateMist * REBATE_MULTIPLIER);
     if (userRebateMist - feeMist - estimatedGasMist <= 0) feeMist = 0;
