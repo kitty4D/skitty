@@ -58,6 +58,13 @@ create a `.env.local` (or set env in Vercel dashboard for prod). the API needs:
 - `SUI_SPONSOR_PRIV` - **hot private key** (`suiprivkey...` or base64) for the wallet that pays gas. use a dedicated wallet holding only what you're willing to front, and keep its address equal to `FEE_RECIPIENT` in `src/constants.ts` — the sponsor only signs transactions where value goes to the sender or to itself, so a mismatch makes every sponsored transaction fail. without it `/api/sponsor` returns 503.
 - `ALLOWED_ORIGINS` (optional) - comma-separated extra origins allowed to call the API. same-origin and localhost are always allowed.
 
+**Funding the sponsor wallet:** it needs at least `SPONSOR_GAS_BUDGET_MIST` (0.05 SUI) of SUI, held either as `Coin<SUI>` objects or as an *address balance* — both can pay gas, but they are selected differently:
+
+- **Address balance** (preferred): paid via an **empty** gas payment plus a transaction expiration. Automatic gas selection does *not* find it — a gas owner holding only a balance fails with "Gas object is not an owned object" — so `api/sponsor.js` requests it explicitly. A balance is not an owned object, so it cannot be equivocated and needs no coin reservation.
+- **Coin objects**: pooled, and each signature reserves one by version.
+
+Check which you have with `getBalance`: `coinBalance` is the coin-object part, `addressBalance` the accumulator part. A wallet funded by a recent transfer often holds everything as an address balance and owns no coins at all — that is fine. If neither source covers the budget, `/api/sponsor` returns a 503 that says so rather than a generic 500.
+
 ## build and test
 
 ```bash
@@ -73,7 +80,7 @@ npm run lint
 ## project layout
 
 - `src/ReclaimDashboard.tsx` - main UI: address input, SuiNS resolve, scan, action list, dry run, execute, feed skitty.
-- `src/useGraphQLScanner.ts` - hook that uses GraphQL + RPC to find mergeable coins, empty kiosks, and burnable objects.
+- `src/useGraphQLScanner.ts` - hook that uses GraphQL to find mergeable coins, empty kiosks, and burnable objects.
 - `src/graphql/client.ts` - the single Sui client the whole app shares, plus SuiNS resolution (see the JSON-RPC note below).
 - `src/buildCleanupTransaction.ts` - builds the `Transaction` for merge, destroy_zero, kiosk close, burn; works out what the batch really reclaims and splits the fee.
 - `src/sponsoredTx.ts` - the shared simulate and execute pipeline (build → sponsor → simulate → sign → submit).

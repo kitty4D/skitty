@@ -114,29 +114,38 @@ function originAllowed(req) {
   });
 }
 
-// A pool rather than a single coin: each issued signature reserves its own coin so two
-// concurrent requests cannot sign conflicting transactions over the same coin version.
-async function fetchSponsorCoins(client, address) {
-  const { objects } = await client.listCoins({
-    owner: address,
-    coinType: SUI_COIN_TYPE,
-    limit: SPONSOR_COIN_POOL_SIZE,
-  });
-  if (!objects?.length) {
-    throw new Error(
-      'Sponsor wallet has no SUI coins. Send some SUI to the sponsor address so it can pay for gas.'
-    );
-  }
+/**
+ * A sponsor's SUI sits in one of two places and gas can come from either, but they are
+ * selected differently:
+ *   - an ADDRESS BALANCE pays gas through an EMPTY gas payment plus an expiration.
+ *     Automatic gas selection does NOT find it (it fails with "Gas object is not an
+ *     owned object"), so it has to be requested explicitly.
+ *   - Coin<SUI> OBJECTS are pooled and reserved, because two signatures over one coin
+ *     version can be equivocated to freeze that coin until end of epoch.
+ * A wallet funded by a recent transfer may hold everything as an address balance and own
+ * no coins at all, so both have to be read to know what this sponsor can actually do.
+ */
+async function fetchSponsorGas(client, address) {
+  const [coinPage, balance] = await Promise.all([
+    client.listCoins({ owner: address, coinType: SUI_COIN_TYPE, limit: SPONSOR_COIN_POOL_SIZE }),
+    client.getBalance({ owner: address, coinType: SUI_COIN_TYPE }),
+  ]);
   // listCoins has no balance ordering, so dust coins sent to the sponsor could otherwise
   // fill the page and crowd out every coin that can actually cover the gas budget
-  return objects
+  const coins = (coinPage?.objects ?? [])
     .map((coin) => ({
       objectId: coin.objectId,
       version: coin.version,
       digest: coin.digest,
       balanceMist: BigInt(coin.balance ?? 0),
     }))
+    .filter((coin) => coin.balanceMist >= BigInt(SPONSOR_GAS_BUDGET_MIST))
     .sort((a, b) => (b.balanceMist > a.balanceMist ? 1 : b.balanceMist < a.balanceMist ? -1 : 0));
+  return {
+    coins,
+    addressBalanceMist: BigInt(balance?.balance?.addressBalance ?? 0),
+    totalBalanceMist: BigInt(balance?.balance?.balance ?? 0),
+  };
 }
 
 async function fetchCurrentEpoch(client) {
@@ -158,9 +167,7 @@ function coinLockKey(coin) {
   return `sponsor_coin_signed:${coin.objectId}:${coin.version}`;
 }
 
-async function reserveCoin(coins, identifier) {
-  // only coins that can actually cover the budget we are about to set
-  const usable = coins.filter((coin) => coin.balanceMist >= BigInt(SPONSOR_GAS_BUDGET_MIST));
+async function reserveCoin(usable, identifier) {
   if (usable.length === 0) return null;
   if (!redis) {
     // no lock store: spread load across the pool so collisions are at least unlikely
@@ -290,10 +297,34 @@ export default async function handler(req, res) {
     const currentEpoch = await fetchCurrentEpoch(gqlClient);
     if (currentEpoch != null) tx.setExpiration({ Epoch: currentEpoch });
 
-    const coins = await fetchSponsorCoins(gqlClient, sponsorAddress);
+    const { coins, addressBalanceMist, totalBalanceMist } = await fetchSponsorGas(
+      gqlClient,
+      sponsorAddress
+    );
+    // An address balance pays gas via an EMPTY gas payment, which the node only accepts
+    // alongside an expiration (there is no object version to bound replay with). It is
+    // preferred over a coin: a balance is not an owned object, so it cannot be
+    // equivocated, needs no reservation, and cannot be pinned by unsubmitted signatures.
+    const budgetMist = BigInt(SPONSOR_GAS_BUDGET_MIST);
+    const useAddressBalance = currentEpoch != null && addressBalanceMist >= budgetMist;
+
+    if (!useAddressBalance && coins.length === 0) {
+      // An operational problem, not a bad request — say exactly what is wrong rather than
+      // letting it fall through to a generic 500 that hides a one-line fix.
+      res.setHeader('Retry-After', '30');
+      const detail =
+        totalBalanceMist > 0n
+          ? `it holds ${totalBalanceMist} mist, which does not cover the ${SPONSOR_GAS_BUDGET_MIST} mist gas budget`
+          : 'it is empty';
+      return res.status(503).json({
+        error: `Sponsor wallet cannot pay gas: ${detail}. Top up the sponsor address.`,
+        sponsorAddress,
+      });
+    }
+
     if (isSimulateOnly) {
       // never submitted, so it needs no reservation and gets no signature
-      tx.setGasPayment([coins[0]]);
+      tx.setGasPayment(useAddressBalance ? [] : [coins[0]]);
       const builtBytes = await tx.build({ client: gqlClient });
       return res.status(200).json({
         sponsoredTxBytes: Buffer.from(builtBytes).toString('base64'),
@@ -301,15 +332,18 @@ export default async function handler(req, res) {
       });
     }
 
-    reservedCoin = await reserveCoin(coins, identifier);
-    if (!reservedCoin) {
-      res.setHeader('Retry-After', '5');
-      return res.status(503).json({
-        error:
-          'Sponsor is busy or low on funded gas coins. Try again in a moment. 🐾',
-      });
+    if (useAddressBalance) {
+      tx.setGasPayment([]);
+    } else {
+      reservedCoin = await reserveCoin(coins, identifier);
+      if (!reservedCoin) {
+        res.setHeader('Retry-After', '5');
+        return res.status(503).json({
+          error: 'Sponsor is busy; every funded gas coin is reserved. Try again in a moment. 🐾',
+        });
+      }
+      tx.setGasPayment([reservedCoin]);
     }
-    tx.setGasPayment([reservedCoin]);
 
     const builtBytes = await tx.build({ client: gqlClient });
 
@@ -380,7 +414,15 @@ export default async function handler(req, res) {
       // describes the caller's own transaction, so it is safe (and useful) to return
       return res.status(400).json({ error: `Rejected: ${error.message}` });
     }
+    // A bare "Sponsorship failed." once hid a one-line operational problem (the sponsor
+    // wallet owning no gas coins) behind an opaque 500. Keep the public message generic,
+    // but always log the cause and allow opting into detail on a deployment you control.
     console.error('[api/sponsor]', error);
-    return res.status(500).json({ error: 'Sponsorship failed.' });
+    return res.status(500).json({
+      error: 'Sponsorship failed.',
+      ...(process.env.SPONSOR_DEBUG === '1'
+        ? { detail: error instanceof Error ? error.message : String(error) }
+        : {}),
+    });
   }
 }
