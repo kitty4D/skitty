@@ -313,12 +313,16 @@ export default async function handler(req, res) {
       gqlClient,
       sponsorAddress
     );
-    // An address balance pays gas via an EMPTY gas payment, which the node only accepts
-    // alongside an expiration (there is no object version to bound replay with). It is
-    // preferred over a coin: a balance is not an owned object, so it cannot be
-    // equivocated, needs no reservation, and cannot be pinned by unsubmitted signatures.
+    // Gas from an address balance is expressed as an EMPTY gas payment (plus an
+    // expiration, since there is no object version to bound replay with). The node
+    // accepts that, but WALLETS DO NOT: an empty payment reads to them as "no gas
+    // selected", so they re-resolve gas against the sender and reject the transaction
+    // with "Gas object is not an owned object with owner: <the user>" — which is fatal
+    // here, because skitty's whole point is users who hold no SUI. A coin object leaves
+    // nothing to re-resolve, so coins are preferred and the balance is only a fallback.
     const budgetMist = BigInt(SPONSOR_GAS_BUDGET_MIST);
-    const useAddressBalance = currentEpoch != null && addressBalanceMist >= budgetMist;
+    const useAddressBalance =
+      coins.length === 0 && currentEpoch != null && addressBalanceMist >= budgetMist;
 
     if (!useAddressBalance && coins.length === 0) {
       // An operational problem, not a bad request — say exactly what is wrong rather than
@@ -329,7 +333,7 @@ export default async function handler(req, res) {
           ? `it holds ${totalBalanceMist} mist, which does not cover the ${SPONSOR_GAS_BUDGET_MIST} mist gas budget`
           : 'it is empty';
       return res.status(503).json({
-        error: `Sponsor wallet cannot pay gas: ${detail}. Top up the sponsor address.`,
+        error: `Sponsor wallet cannot pay gas: ${detail}. Send SUI to the sponsor address as a Coin<SUI> object.`,
         sponsorAddress,
       });
     }
