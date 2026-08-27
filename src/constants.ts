@@ -39,24 +39,43 @@ export const KNOWN_BURNABLE: { typePattern: string; target: string }[] = [
 export const SUI_COIN_TYPE_ARG = '0x2::sui::SUI';
 export const SUI_COIN_TYPE_ARG_LONG = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
 
-// core protected types: never suggest burn/destroy for these, even if a burn exists
+// core protected types: never suggest burn/destroy for these, even if a burn exists.
+// Package addresses must match what the node actually reports or the guard silently
+// never fires — staking lives in the sui_system package (0x3), and SuiNS types live
+// in the SuiNS package, not the framework.
 export const CORE_PROTECTED_TYPES: string[] = [
-  '0x2::staking_pool::StakedSui',
-  '0x2::staking_pool::StakedSuiV2',
+  '0x3::staking_pool::StakedSui',
+  '0x3::staking_pool::FungibleStakedSui',
   '0x2::kiosk::KioskOwnerCap',
   '0x2::kiosk::Kiosk',
-  '0x2::suins::SuinsRegistration',
-  '0x2::domain::Domain',
   '0x2::display::Display',
   '0x2::package::UpgradeCap',
   '0x2::package::Publisher',
+  '0x2::coin::TreasuryCap',
+  '0x2::coin::CoinMetadata',
+  // SuiNS mainnet. Addresses here must be the package that DEFINED the type, which is
+  // what object types report — subdomains arrived in a later upgrade, so they carry a
+  // different address than the original package.
+  '0xd22b24490e0bae52676651b4f56660a5ff8022a2576e0089f79b3c88d44e08f0::suins_registration::SuinsRegistration',
+  '0x00c2f85e07181b90c140b15c5ce27d863f93c4d9159d2a4e7bdaeb40e286d6f5::subdomain_registration::SubDomainRegistration',
 ];
 
+// The node reports framework addresses in short form (0x2) in some places and fully
+// padded (0x000…002) in others, so every Move-type comparison has to normalize first.
+export function normalizeTypeAddress(type: string): string {
+  return type.replace(/^0x0*([0-9a-fA-F])/, '0x$1').toLowerCase();
+}
+
+export function isSameMoveType(a: string, b: string): boolean {
+  return normalizeTypeAddress(a) === normalizeTypeAddress(b);
+}
+
 export function isProtectedType(objectType: string): boolean {
-  return CORE_PROTECTED_TYPES.some(
-    (protectedType) =>
-      objectType === protectedType || objectType.startsWith(protectedType + '<')
-  );
+  const normalized = normalizeTypeAddress(objectType);
+  return CORE_PROTECTED_TYPES.some((protectedType) => {
+    const target = normalizeTypeAddress(protectedType);
+    return normalized === target || normalized.startsWith(target + '<');
+  });
 }
 
 // skitty explain: max requests per minute

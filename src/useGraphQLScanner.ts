@@ -1,7 +1,13 @@
 import * as React from 'react';
 import { graphQLClient } from './graphql/client';
-import { rpcClient } from './rpcClient';
-import { REBATE_MULTIPLIER, ESTIMATED_GAS, isProtectedType } from './constants';
+import {
+  REBATE_MULTIPLIER,
+  ESTIMATED_GAS,
+  MAX_MERGES_PER_BATCH,
+  isProtectedType,
+  isSameMoveType,
+  normalizeTypeAddress,
+} from './constants';
 import { computeFeeMist } from './buildCleanupTransaction';
 import type {
   CleanupAction,
@@ -13,10 +19,30 @@ import type {
   ScanProgress,
 } from './types';
 import { KNOWN_BURNABLE, SUI_COIN_TYPE_ARG, SUI_COIN_TYPE_ARG_LONG } from './constants';
-import { getCoinTypeArg, getWalletCoinBlocklist, getWalletObjectBlocklist } from './walletBlocklist';
-import type { SuiMoveNormalizedModule, SuiObjectData } from '@mysten/sui/jsonRpc';
+import {
+  getCoinTypeArg,
+  getWalletCoinBlocklist,
+  getWalletObjectBlocklist,
+  isObjectTypeBlockedIn,
+} from './walletBlocklist';
+import { actionKey } from './actionIdentity';
 
-const COIN_TYPE_PREFIX = '0x2::coin::Coin<';
+const COIN_TYPE_PREFIX = '0x2::coin::coin<';
+
+// The SDK resolves GraphQL errors rather than throwing, so a rate-limited or failed
+// query arrives as { data: undefined, errors: [...] } and reads as "nothing found".
+// Every query goes through here so a failure becomes a scan error, not an empty vault.
+async function runQuery(options: {
+  query: string;
+  variables: Record<string, unknown>;
+}): Promise<{ data: unknown }> {
+  const { data, errors } = await graphQLClient.query(options);
+  if (errors?.length) {
+    throw new Error(`Sui GraphQL error: ${errors[0]!.message}`);
+  }
+  if (data == null) throw new Error('Sui GraphQL returned no data.');
+  return { data };
+}
 const KIOSK_TYPE = '0x2::kiosk::Kiosk';
 const KIOSK_OWNER_CAP_TYPE = '0x2::kiosk::KioskOwnerCap';
 const BURN_FUNCTION_NAMES = ['burn', 'delete', 'destroy'];
@@ -32,11 +58,18 @@ export function useGraphQLScanner(address: string | null) {
     scanProgress: null,
   });
 
+  // bumped whenever a scan starts or the address changes, so a slow scan that has
+  // been superseded cannot write its results over the newer address's state
+  const scanEpochRef = React.useRef(0);
+
   const scan = React.useCallback(async () => {
     if (!address) {
       setState(prev => ({ ...prev, error: 'No address provided', loading: false }));
       return;
     }
+
+    const epoch = ++scanEpochRef.current;
+    const isStale = () => scanEpochRef.current !== epoch;
 
     setState(prev => ({
       ...prev,
@@ -49,6 +82,7 @@ export function useGraphQLScanner(address: string | null) {
 
     try {
       const updateProgress = (progress: ScanProgress) => {
+        if (isStale()) return;
         setState(prev => ({ ...prev, scanProgress: progress }));
       };
 
@@ -59,7 +93,9 @@ export function useGraphQLScanner(address: string | null) {
       const kioskResult = await findEmptyKiosksByGraphQL(address, updateProgress);
 
       updateProgress({ phase: 'fetching NFTs', current: 0, total: 1 });
-      const burnableResult = await findBurnableObjectsByRPC(address, updateProgress);
+      const burnableResult = await findBurnableObjects(address, updateProgress);
+
+      if (isStale()) return;
 
       const actions: CleanupAction[] = [
         ...coinResults,
@@ -77,10 +113,12 @@ export function useGraphQLScanner(address: string | null) {
         scannedAddress: address,
       }));
     } catch (error) {
+      if (isStale()) return;
       setState(prev => ({
         ...prev,
         loading: false,
         scanProgress: null,
+        actions: [],
         error: error instanceof Error ? error.message : String(error),
       }));
     }
@@ -91,20 +129,19 @@ export function useGraphQLScanner(address: string | null) {
     const allIds = [...new Set(executedActions.flatMap((a) => a.objectIds))];
     if (allIds.length === 0) return;
     try {
-      const responses = await rpcClient.multiGetObjects({
-        ids: allIds,
-        options: {},
-      });
+      const { objects } = await graphQLClient.getObjects({ objectIds: allIds });
       const existingIds = new Set<string>();
-      responses.forEach((res, i) => {
-        if (res.data && allIds[i]) existingIds.add(allIds[i]);
+      objects.forEach((obj, i) => {
+        // a deleted object comes back as an Error entry rather than throwing
+        if (!(obj instanceof Error) && obj?.objectId && allIds[i]) existingIds.add(allIds[i]);
       });
-      const actionKey = (a: CleanupAction) =>
-        `${a.kind}:${a.objectIds.slice().sort().join(',')}`;
       const keysToRemove = new Set<string>();
       for (const a of executedActions) {
-        const allGone = a.objectIds.every((id) => !existingIds.has(id));
-        if (allGone) keysToRemove.add(actionKey(a));
+        const remaining = a.objectIds.filter((id) => existingIds.has(id));
+        // a merge keeps its primary coin alive by design, so "every id gone" never
+        // holds for it — an action is spent once it can no longer be performed
+        const spent = a.kind === 'merge_coins' ? remaining.length <= 1 : remaining.length === 0;
+        if (spent) keysToRemove.add(actionKey(a));
       }
       if (keysToRemove.size === 0) return;
       setState((prev) => {
@@ -122,8 +159,12 @@ export function useGraphQLScanner(address: string | null) {
   }, []);
 
   React.useEffect(() => {
+    // abandon any in-flight scan for the previous address
+    scanEpochRef.current += 1;
     setState(prev => ({
       ...prev,
+      loading: false,
+      scanProgress: null,
       error: null,
       actions: [],
       totalUserRebateMist: 0,
@@ -171,13 +212,13 @@ async function findCoinActionsByGraphQL(
   const coins: CoinNode[] = [];
   let after: string | null = null;
 
-  try {
+  {
     let pageCount = 0;
     while (true) {
       const variables: { owner: string; after?: string } = { owner: address };
       if (after != null) variables.after = after;
 
-      const { data } = await graphQLClient.query({
+      const { data } = await runQuery({
         query: `
           query GetOwnedCoins($owner: SuiAddress!, $after: String) {
             address(address: $owner) {
@@ -196,19 +237,21 @@ async function findCoinActionsByGraphQL(
         `,
         variables,
       });
-      const connection = (data as { address?: { objects?: { nodes?: CoinNode[]; pageInfo?: { endCursor?: string } } } })?.address?.objects;
+      const connection = (data as { address?: { objects?: { nodes?: CoinNode[]; pageInfo?: { hasNextPage?: boolean; endCursor?: string } } } })?.address?.objects;
       const nodes = connection?.nodes ?? [];
       coins.push(...nodes);
       pageCount += 1;
       updateProgress({ phase: 'fetching coins', current: pageCount, total: pageCount + 1 });
 
+      // a connection may legally return fewer than `first` nodes and still have more
+      // pages, so drive the loop off hasNextPage rather than the node count
       const endCursor = connection?.pageInfo?.endCursor ?? null;
-      if (nodes.length < PAGE_SIZE || !endCursor) break;
+      if (!connection?.pageInfo?.hasNextPage || !endCursor) break;
       after = endCursor;
     }
     updateProgress({ phase: 'analyzing coins', current: 0, total: coins.length });
 
-    const coinsByType = new Map<string, { objectIds: string[]; balances: string[]; storageRebateTotal: number }>();
+    const coinsByType = new Map<string, { objectIds: string[]; balances: string[]; rebates: string[]; storageRebateTotal: number }>();
     const zeroBalanceCoins: { address: string; coinType: string; storageRebate: number }[] = [];
     let current = 0;
 
@@ -224,9 +267,10 @@ async function findCoinActionsByGraphQL(
       if (balance === 0n) {
         zeroBalanceCoins.push({ address: coin.address, coinType, storageRebate });
       } else {
-        const group = coinsByType.get(coinType) ?? { objectIds: [], balances: [], storageRebateTotal: 0 };
+        const group = coinsByType.get(coinType) ?? { objectIds: [], balances: [], rebates: [], storageRebateTotal: 0 };
         group.objectIds.push(coin.address);
         group.balances.push(String(balance));
+        group.rebates.push(String(storageRebate));
         group.storageRebateTotal += storageRebate;
         coinsByType.set(coinType, group);
       }
@@ -241,17 +285,26 @@ async function findCoinActionsByGraphQL(
       const typeArg = getCoinTypeArg(coinType);
       if (blocklist.has(typeArg)) continue;
       if (typeArg === SUI_COIN_TYPE_ARG || typeArg === SUI_COIN_TYPE_ARG_LONG) continue;
-      const userRebateMist = Math.floor(group.storageRebateTotal * REBATE_MULTIPLIER);
-      const feeMist = computeFeeMist(group.storageRebateTotal);
+      // merging N coins destroys N-1: the first coin survives as the merge target and
+      // its rebate is never reclaimed, and anything past MAX_MERGES_PER_BATCH is left
+      // for a later run. Quoting the full sum would overstate what the user gets back
+      // and, in sponsored mode, overdraw the sponsor.
+      const mergedIds = group.objectIds.slice(0, MAX_MERGES_PER_BATCH);
+      const realizedRebate = group.rebates
+        .slice(1, mergedIds.length)
+        .reduce((sum, r) => sum + Number(r), 0);
+      const userRebateMist = Math.floor(realizedRebate * REBATE_MULTIPLIER);
+      const feeMist = computeFeeMist(realizedRebate);
       if (userRebateMist < estMerge + feeMist) continue;
       const label = typeArg.indexOf('::') !== -1 ? typeArg.slice(typeArg.indexOf('::') + 2) : typeArg;
       mergeActions.push({
         kind: 'merge_coins',
         coinType,
         label,
-        objectIds: group.objectIds,
-        objectBalances: group.balances,
-        storageRebateTotal: String(group.storageRebateTotal),
+        objectIds: mergedIds,
+        objectBalances: group.balances.slice(0, mergedIds.length),
+        objectStorageRebates: group.rebates.slice(0, mergedIds.length),
+        storageRebateTotal: String(realizedRebate),
         userRebateMist,
         estimatedGasMist: estMerge,
         netGainMist: userRebateMist - estMerge - feeMist,
@@ -272,6 +325,7 @@ async function findCoinActionsByGraphQL(
         kind: 'destroy_zero',
         coinType: z.coinType,
         objectIds: [z.address],
+        objectStorageRebates: [String(z.storageRebate)],
         storageRebateTotal: String(z.storageRebate),
         userRebateMist,
         estimatedGasMist: estZero,
@@ -281,8 +335,6 @@ async function findCoinActionsByGraphQL(
     }
 
     return [...mergeActions, ...destroyZeroActions];
-  } catch {
-    return [];
   }
 }
 
@@ -293,15 +345,30 @@ async function findEmptyKiosksByGraphQL(
 ): Promise<CloseKioskAction[]> {
   updateProgress({ phase: 'fetching kiosk caps', current: 0, total: 1 });
 
-  try {
-    const { data: capsData } = await graphQLClient.query({
+  type KioskCapNode = { address: string; storageRebate?: string | number; contents?: { json?: { for?: string } } };
+  type AddressObjects = {
+    address?: { objects?: { nodes?: KioskCapNode[]; pageInfo?: { hasNextPage?: boolean; endCursor?: string } } };
+  };
+
+  const PAGE_SIZE = 50;
+  const kioskCaps: KioskCapNode[] = [];
+  let after: string | null = null;
+
+  // paginate: a wallet with more than one page of caps would otherwise have the rest
+  // of its closeable kiosks silently ignored
+  while (true) {
+    const variables: { owner: string; after?: string } = { owner: address };
+    if (after != null) variables.after = after;
+
+    const { data: capsData } = await runQuery({
       query: `
-        query GetKioskOwnerCaps($owner: SuiAddress!) {
+        query GetKioskOwnerCaps($owner: SuiAddress!, $after: String) {
           address(address: $owner) {
             objects(
               filter: { type: "0x2::kiosk::KioskOwnerCap" }
-              first: 50
+              first: ${PAGE_SIZE}, after: $after
             ) {
+              pageInfo { hasNextPage endCursor }
               nodes {
                 ... on MoveObject {
                   address
@@ -316,70 +383,107 @@ async function findEmptyKiosksByGraphQL(
           }
         }
       `,
-      variables: { owner: address },
+      variables,
     });
 
-    type KioskCapNode = { address: string; storageRebate?: string | number; contents?: { json?: { for?: string } } };
-    type AddressObjects = { address?: { objects?: { nodes?: KioskCapNode[] } } };
-    const kioskCaps = (capsData as AddressObjects)?.address?.objects?.nodes || [];
-    updateProgress({ phase: 'checking kiosks', current: 0, total: kioskCaps.length });
-    const est = ESTIMATED_GAS.closeKiosk;
-    const closeActions: CloseKioskAction[] = [];
-    const objectBlocklist = await getWalletObjectBlocklist();
-    if (objectBlocklist.has(KIOSK_TYPE)) return closeActions;
-    let current = 0;
-
-    for (const cap of kioskCaps) {
-      current++;
-      updateProgress({ phase: 'checking kiosks', current, total: kioskCaps.length });
-      const json = cap.contents?.json;
-      const kioskId = json?.for ?? null;
-      if (!kioskId) continue;
-      if (!(await isKioskEmptyByGraphQL(kioskId))) continue;
-      const storageRebateTotal = Number(cap.storageRebate ?? 0);
-      const userRebateMist = Math.floor(storageRebateTotal * REBATE_MULTIPLIER);
-      const feeMist = computeFeeMist(storageRebateTotal);
-      if (userRebateMist < est + feeMist) continue;
-      closeActions.push({
-        kind: 'close_kiosk',
-        kioskId,
-        ownerCapId: cap.address,
-        label: kioskId,
-        objectIds: [kioskId],
-        storageRebateTotal: String(storageRebateTotal),
-        userRebateMist,
-        estimatedGasMist: est,
-        netGainMist: userRebateMist - est - feeMist,
-      });
-    }
-    return closeActions;
-  } catch {
-    return [];
+    const connection = (capsData as AddressObjects)?.address?.objects;
+    kioskCaps.push(...(connection?.nodes ?? []));
+    const endCursor = connection?.pageInfo?.endCursor ?? null;
+    if (!connection?.pageInfo?.hasNextPage || !endCursor) break;
+    after = endCursor;
   }
+
+  updateProgress({ phase: 'checking kiosks', current: 0, total: kioskCaps.length });
+  const est = ESTIMATED_GAS.closeKiosk;
+  const closeActions: CloseKioskAction[] = [];
+  const objectBlocklist = await getWalletObjectBlocklist();
+  if (isObjectTypeBlockedIn(objectBlocklist, KIOSK_TYPE)) return closeActions;
+  let current = 0;
+
+  for (const cap of kioskCaps) {
+    current++;
+    updateProgress({ phase: 'checking kiosks', current, total: kioskCaps.length });
+    const json = cap.contents?.json;
+    const kioskId = json?.for ?? null;
+    if (!kioskId) continue;
+    const kiosk = await inspectKiosk(kioskId);
+    if (!kiosk || !kiosk.empty) continue;
+    // closing deletes BOTH the kiosk and its owner cap, so both rebates come back
+    const capRebate = Number(cap.storageRebate ?? 0);
+    const storageRebateTotal = capRebate + kiosk.storageRebateMist;
+    const userRebateMist = Math.floor(storageRebateTotal * REBATE_MULTIPLIER);
+    const feeMist = computeFeeMist(storageRebateTotal);
+    if (userRebateMist < est + feeMist) continue;
+    closeActions.push({
+      kind: 'close_kiosk',
+      kioskId,
+      ownerCapId: cap.address,
+      label: kioskId,
+      objectIds: [kioskId],
+      objectStorageRebates: [String(storageRebateTotal)],
+      storageRebateTotal: String(storageRebateTotal),
+      profitsMist: kiosk.profitsMist,
+      userRebateMist,
+      estimatedGasMist: est,
+      netGainMist: userRebateMist - est - feeMist,
+    });
+  }
+  return closeActions;
 }
 
-// check if kiosk is empty via GraphQL
-async function isKioskEmptyByGraphQL(kioskId: string): Promise<boolean> {
+/**
+ * Read a kiosk's own storage rebate, profits, and item count from the fullnode.
+ * `close_and_withdraw` aborts unless item_count is 0, and it pays out `profits`,
+ * so both matter before we offer to close it.
+ */
+async function inspectKiosk(
+  kioskId: string
+): Promise<{ empty: boolean; storageRebateMist: number; profitsMist: number } | null> {
   try {
-    const { data } = await graphQLClient.query({
+    const { data } = await runQuery({
       query: `
-        query GetKioskDynamicFields($id: SuiAddress!) {
+        query GetKiosk($id: SuiAddress!) {
+          object(address: $id) {
+            storageRebate
+            asMoveObject { contents { json } }
+          }
           address(address: $id) {
-            dynamicFields(first: 1) {
-              nodes {
-                name { type { repr } }
-              }
-            }
+            dynamicFields(first: 1) { nodes { name { type { repr } } } }
           }
         }
       `,
       variables: { id: kioskId },
     });
-    type AddressDynamicFields = { address?: { dynamicFields?: { nodes?: unknown[] } } };
-    const nodes = (data as AddressDynamicFields)?.address?.dynamicFields?.nodes ?? [];
-    return nodes.length === 0;
+    type KioskObject = {
+      object?: {
+        storageRebate?: string | number;
+        asMoveObject?: { contents?: { json?: Record<string, unknown> } };
+      };
+      address?: { dynamicFields?: { nodes?: unknown[] } };
+    };
+    const object = (data as KioskObject)?.object;
+    const fields = object?.asMoveObject?.contents?.json;
+    if (!fields) return null;
+    const itemCount = Number(fields.item_count ?? 0);
+    if (!Number.isFinite(itemCount)) return null;
+    // item_count only covers items. Kiosk extensions live as dynamic fields on the
+    // kiosk's UID and never touch it, and close_and_withdraw deletes the UID outright —
+    // orphaning that extension's storage. Require the kiosk to be empty both ways.
+    const dynamicFieldCount = (data as KioskObject)?.address?.dynamicFields?.nodes?.length ?? 0;
+    // profits is a Balance<SUI>, which serializes either as a bare u64 string or as { value }
+    const profits = fields.profits;
+    const profitsMist = Number(
+      typeof profits === 'object' && profits !== null
+        ? (profits as { value?: string }).value ?? 0
+        : profits ?? 0
+    );
+    return {
+      empty: itemCount === 0 && dynamicFieldCount === 0,
+      storageRebateMist: Number(object?.storageRebate ?? 0),
+      profitsMist: Number.isFinite(profitsMist) ? profitsMist : 0,
+    };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -394,119 +498,169 @@ function parseMoveType(
   return { package: pkg!, module: mod!, name: name!, typeArgs };
 }
 
-function getStructFromNormalizedType(t: unknown): { address: string; module: string; name: string } | null {
-  if (typeof t !== 'object' || t === null) return null;
-  const o = t as Record<string, unknown>;
-  if (o.Struct && typeof o.Struct === 'object')
-    return (o.Struct as { address: string; module: string; name: string });
-  if (o.Reference) return getStructFromNormalizedType(o.Reference);
-  if (o.MutableReference) return getStructFromNormalizedType(o.MutableReference);
-  return null;
+// GraphQL exposes Move functions one at a time (there is no normalized-module call),
+// so we look up each candidate burn name directly and cache the answer per module.
+type MoveFunction = {
+  typeParameters?: unknown[];
+  parameters?: OpenSignature[];
+};
+
+type OpenSignature = {
+  reference?: string | null;
+  body?: OpenSignatureBody;
+};
+
+type OpenSignatureBody =
+  | { $kind: 'datatype'; datatype?: { typeName?: string; typeParameters?: unknown[] } }
+  | { $kind: string; [key: string]: unknown };
+
+// the parameter's underlying datatype name, e.g. "0x2::kiosk::Kiosk"
+function datatypeNameOf(param: OpenSignature | undefined): string | null {
+  const body = param?.body;
+  if (!body || body.$kind !== 'datatype') return null;
+  const typeName = (body as { datatype?: { typeName?: string } }).datatype?.typeName;
+  return typeName ?? null;
 }
 
-function structMatchesObjectType(
-  struct: { address: string; module: string; name: string },
-  objectType: string
-): boolean {
+function isTxContextParam(param: OpenSignature): boolean {
+  return datatypeNameOf(param)?.endsWith('::tx_context::TxContext') ?? false;
+}
+
+function sameMoveType(a: string, b: string): boolean {
+  return normalizeTypeAddress(a) === normalizeTypeAddress(b);
+}
+
+// A "burn" is only usable if we can actually call it: buildBatchTransaction emits a
+// single object argument and no type arguments, so anything generic or needing extra
+// arguments (a registry, a cap, a witness) would just fail at build time. Being strict
+// here also shrinks the set of objects we are willing to call destructible at all.
+function burnFunctionMatches(fn: MoveFunction, objectType: string): boolean {
+  if ((fn.typeParameters?.length ?? 0) > 0) return false;
   const parsed = parseMoveType(objectType);
-  if (!parsed) return false;
-  return (
-    struct.address === parsed.package &&
-    struct.module === parsed.module &&
-    struct.name === parsed.name
-  );
+  // a generic object would need type arguments we never pass
+  if (!parsed || parsed.typeArgs?.length) return false;
+  const params = (fn.parameters ?? []).filter((p) => !isTxContextParam(p));
+  if (params.length !== 1) return false;
+  // by-reference means the function borrows the object rather than consuming it, so it
+  // cannot be destroying anything — the call would succeed, the object would survive,
+  // and we would have charged a fee against a storage rebate that never materialized
+  if (params[0].reference != null) return false;
+  const only = datatypeNameOf(params[0]);
+  if (!only) return false;
+  return sameMoveType(only, `${parsed.package}::${parsed.module}::${parsed.name}`);
 }
 
-function findBurnFunction(
-  normalizedModule: SuiMoveNormalizedModule,
-  objectType: string
-): string | null {
-  const funcs = normalizedModule?.exposedFunctions ?? {};
+const burnFunctionCache = new Map<string, MoveFunction | null>();
+
+async function getMoveFunctionCached(
+  packageId: string,
+  moduleName: string,
+  name: string
+): Promise<MoveFunction | null> {
+  const key = `${packageId}::${moduleName}::${name}`;
+  const cached = burnFunctionCache.get(key);
+  if (cached !== undefined) return cached;
+  try {
+    const res = await graphQLClient.getMoveFunction({ packageId, moduleName, name });
+    const result = (res?.function as MoveFunction) ?? null;
+    burnFunctionCache.set(key, result);
+    return result;
+  } catch {
+    // The SDK throws the same way for "no such function" and for a network/rate-limit
+    // failure, so this is not cached — caching a transient failure would permanently
+    // mark a real burn entry point as nonexistent for the rest of the session.
+    return null;
+  }
+}
+
+async function findBurnFunction(objectType: string): Promise<string | null> {
+  const parsed = parseMoveType(objectType);
+  if (!parsed) return null;
   for (const name of BURN_FUNCTION_NAMES) {
-    const fn = funcs[name];
-    if (!fn) continue;
-    const params = fn.parameters;
-    if (params.length === 0) continue;
-    const firstParam = getStructFromNormalizedType(params[0]);
-    if (firstParam && structMatchesObjectType(firstParam, objectType)) return name;
+    const fn = await getMoveFunctionCached(parsed.package, parsed.module, name);
+    if (fn && burnFunctionMatches(fn, objectType)) return name;
   }
   return null;
 }
 
-const burnModuleCache = new Map<string, SuiMoveNormalizedModule | null>();
-let burnModuleQueue: Array<{ key: string; resolve: (m: SuiMoveNormalizedModule | null) => void }> = [];
-let burnModuleTimer: ReturnType<typeof setTimeout> | null = null;
-const BURN_MODULE_DEBOUNCE_MS = 100;
-
-async function getBurnModuleCached(
-  packageId: string,
-  moduleName: string
-): Promise<SuiMoveNormalizedModule | null> {
-  const key = `${packageId}::${moduleName}`;
-  const cached = burnModuleCache.get(key);
-  if (cached !== undefined) return cached;
-  return new Promise((resolve) => {
-    burnModuleQueue.push({ key, resolve });
-    if (!burnModuleTimer) {
-      burnModuleTimer = setTimeout(async () => {
-        burnModuleTimer = null;
-        const queue = burnModuleQueue;
-        burnModuleQueue = [];
-        const keys = [...new Set(queue.map((q) => q.key))];
-        const results = new Map<string, SuiMoveNormalizedModule | null>();
-        for (const k of keys) {
-          if (burnModuleCache.has(k)) {
-            results.set(k, burnModuleCache.get(k)!);
-            continue;
-          }
-          const [pkg, mod] = k.split('::');
-          try {
-            const modResult = await rpcClient.getNormalizedMoveModule({ package: pkg!, module: mod! });
-            burnModuleCache.set(k, modResult);
-            results.set(k, modResult);
-          } catch {
-            burnModuleCache.set(k, null);
-            results.set(k, null);
-          }
-        }
-        queue.forEach(({ key: qKey, resolve: r }) => r(results.get(qKey) ?? null));
-      }, BURN_MODULE_DEBOUNCE_MS);
-    }
-  });
-}
-
-// find burnable objects via RPC: fetch owned objects, group by type, discover burn via getNormalizedMoveModule
-async function findBurnableObjectsByRPC(
+// find burnable objects: page through owned objects, group by type, look for a burn entry point
+async function findBurnableObjects(
   address: string,
   updateProgress: (progress: ScanProgress) => void
 ): Promise<BurnAction[]> {
   updateProgress({ phase: 'fetching NFTs', current: 0, total: 1 });
 
-  try {
-    const objects: SuiObjectData[] = [];
-    let cursor: string | null = null;
+  {
+    type OwnedObjectNode = {
+      address: string;
+      storageRebate?: string | number;
+      contents?: { type?: { repr?: string } };
+    };
+    const PAGE_SIZE = 50;
+    const objects: { objectId: string; type: string; storageRebate: number }[] = [];
+    let after: string | null = null;
     let pageCount = 0;
+
     while (true) {
-      const page = await rpcClient.getOwnedObjects({
-        owner: address,
-        options: { showType: true, showStorageRebate: true, showContent: true },
-        cursor: cursor ?? undefined,
-        limit: 50,
+      const variables: { owner: string; after?: string } = { owner: address };
+      if (after != null) variables.after = after;
+
+      const { data } = await runQuery({
+        query: `
+          query GetOwnedObjects($owner: SuiAddress!, $after: String) {
+            address(address: $owner) {
+              objects(first: ${PAGE_SIZE}, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  ... on MoveObject {
+                    address
+                    storageRebate
+                    contents { type { repr } }
+                  }
+                }
+              }
+            }
+          }
+        `,
+        variables,
       });
-      for (const item of page.data) {
-        const obj = item.data;
-        if (obj?.type) objects.push(obj);
+
+      const connection = (
+        data as {
+          address?: {
+            objects?: {
+              nodes?: OwnedObjectNode[];
+              pageInfo?: { hasNextPage?: boolean; endCursor?: string };
+            };
+          };
+        }
+      )?.address?.objects;
+      for (const node of connection?.nodes ?? []) {
+        const type = node.contents?.type?.repr;
+        if (!type || !node.address) continue;
+        objects.push({
+          objectId: node.address,
+          type,
+          storageRebate: Number(node.storageRebate ?? 0),
+        });
       }
       pageCount += 1;
       updateProgress({ phase: 'fetching NFTs', current: pageCount, total: pageCount + 1 });
-      if (!page.hasNextPage || !page.nextCursor) break;
-      cursor = page.nextCursor;
+
+      const endCursor = connection?.pageInfo?.endCursor ?? null;
+      if (!connection?.pageInfo?.hasNextPage || !endCursor) break;
+      after = endCursor;
     }
 
-    const byType = new Map<string, SuiObjectData[]>();
+    const byType = new Map<string, typeof objects>();
     for (const obj of objects) {
-      const type = obj.type!;
-      if (type.startsWith(COIN_TYPE_PREFIX) || type === KIOSK_TYPE || type === KIOSK_OWNER_CAP_TYPE)
+      const type = obj.type;
+      // the node reports padded addresses, so this has to be a normalized comparison
+      if (
+        normalizeTypeAddress(type).startsWith(COIN_TYPE_PREFIX) ||
+        isSameMoveType(type, KIOSK_TYPE) ||
+        isSameMoveType(type, KIOSK_OWNER_CAP_TYPE)
+      )
         continue;
       if (isProtectedType(type)) continue;
       const list = byType.get(type) ?? [];
@@ -523,7 +677,7 @@ async function findBurnableObjectsByRPC(
     for (let i = 0; i < types.length; i++) {
       updateProgress({ phase: 'discovering burn', current: i + 1, total: types.length });
       const objectType = types[i];
-      if (objectBlocklist.has(objectType)) continue;
+      if (isObjectTypeBlockedIn(objectBlocklist, objectType)) continue;
       const list = byType.get(objectType)!;
       let moveTarget: string | null = null;
       let discovered = false;
@@ -535,20 +689,16 @@ async function findBurnableObjectsByRPC(
         moveTarget = known.target;
       } else {
         const parsed = parseMoveType(objectType);
-        if (parsed) {
-          const mod = await getBurnModuleCached(parsed.package, parsed.module);
-          if (mod) {
-            const fnName = findBurnFunction(mod, objectType);
-            if (fnName) {
-              moveTarget = `${parsed.package}::${parsed.module}::${fnName}`;
-              discovered = true;
-            }
-          }
+        const fnName = parsed ? await findBurnFunction(objectType) : null;
+        if (parsed && fnName) {
+          moveTarget = `${parsed.package}::${parsed.module}::${fnName}`;
+          discovered = true;
         }
       }
 
       if (!moveTarget) continue;
       const objectIds = list.map((o) => o.objectId);
+      const objectStorageRebates = list.map((o) => String(Number(o.storageRebate ?? 0)));
       const storageRebateTotal = list.reduce(
         (sum, o) => sum + Number(o.storageRebate ?? 0),
         0
@@ -564,6 +714,7 @@ async function findBurnableObjectsByRPC(
         moveTarget,
         discovered,
         objectIds,
+        objectStorageRebates,
         storageRebateTotal: String(storageRebateTotal),
         userRebateMist,
         estimatedGasMist: gasEst,
@@ -572,7 +723,5 @@ async function findBurnableObjectsByRPC(
       });
     }
     return burnActions;
-  } catch {
-    return [];
   }
 }

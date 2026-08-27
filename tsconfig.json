@@ -18,9 +18,7 @@
     "noUncheckedSideEffectImports": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"],
-      "@mysten/sui/client": ["node_modules/@mysten/sui/dist/esm/client/index.d.ts"],
-      "@mysten/sui/transactions": ["node_modules/@mysten/sui/dist/esm/transactions/index.d.ts"]
+      "@/*": ["src/*"]
     }
   },
   "include": ["src"]

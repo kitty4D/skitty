@@ -1,8 +1,7 @@
 import { SuinsClient } from '@mysten/suins';
 import { graphQLClient } from '../graphql/client';
-import { rpcClient } from '../rpcClient';
 
-const suinsClient = new SuinsClient({ client: rpcClient });
+const suinsClient = new SuinsClient({ client: graphQLClient });
 
 // cache resolved domains so we don't look up again
 const domainCache = new Map<string, string | null>();

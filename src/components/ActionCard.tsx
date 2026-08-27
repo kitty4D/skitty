@@ -33,7 +33,7 @@ const itemVariants = {
 
 export function ActionCard({
   action,
-  index,
+  domId,
   selected,
   onToggle,
   shortLabel,
@@ -44,10 +44,12 @@ export function ActionCard({
   onDryRun,
   onExecute,
   executing,
+  simulating = false,
   canSponsor = true,
 }: {
   action: CleanupAction;
-  index: number;
+  /** stable id derived from the action's objects, not its position in the list */
+  domId: string;
   selected: boolean;
   onToggle: () => void;
   shortLabel: string;
@@ -59,9 +61,11 @@ export function ActionCard({
   onDryRun: () => void;
   onExecute: () => void;
   executing: boolean;
+  simulating?: boolean;
   /** false when rebate does not cover gas + fee; single-action execute disabled */
   canSponsor?: boolean;
 }) {
+  const isDestructive = action.kind === 'burn' || action.kind === 'close_kiosk';
   const isDiscovered = action.kind === 'burn' && (action as BurnAction).discovered;
   const isCoin = action.kind === 'merge_coins' || action.kind === 'destroy_zero';
   const coinType = isCoin ? (action as MergeCoinsAction | DestroyZeroAction).coinType : '';
@@ -114,7 +118,7 @@ export function ActionCard({
         <div className="flex-1 min-w-0">
           {interactive ? (
             <Checkbox
-              id={`action-${index}`}
+              id={domId}
               checked={selected}
               onChange={() => onToggle()}
               aria-label={`${selected ? 'Unselect' : 'Select'} action ${shortLabel}`}
@@ -150,8 +154,13 @@ export function ActionCard({
             {(action.kind === 'destroy_zero' || action.kind === 'close_kiosk' || action.kind === 'burn') && (
               <div className="space-y-1">
                 {isDiscovered && (
-                  <span className="inline-block px-1.5 py-0.5 bg-skitty-accent text-white text-[8px] font-black tracking-widest mb-1">
-                    NEW DISCOVERY
+                  // reads as a warning, not a feature: this burn was matched by function
+                  // name alone, so we cannot vouch for what the object is worth
+                  <span
+                    className="inline-block px-1.5 py-0.5 bg-amber-400 text-black text-[8px] font-black tracking-widest mb-1"
+                    title="Burn function found by name only — skitty has not verified this object is worthless. Check it before destroying."
+                  >
+                    ⚠ UNVERIFIED BURN
                   </span>
                 )}
                 {action.objectIds.map((id) => (
@@ -195,35 +204,44 @@ export function ActionCard({
                   e.stopPropagation();
                   onDryRun();
                 }}
-                className="p-1.5 bg-black border border-white/10 hover:border-skitty-accent hover:text-skitty-accent transition-all group/btn shadow-[2px_2px_0_#000]"
+                disabled={simulating}
+                className="p-1.5 bg-black border border-white/10 hover:border-skitty-accent hover:text-skitty-accent transition-all group/btn shadow-[2px_2px_0_#000] disabled:opacity-20"
                 title="RUN SIMULATION"
+                aria-label={`Simulate ${shortLabel}`}
               >
                 <FlaskConical className="h-3.5 w-3.5" />
               </button>
-              {interactive && (
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onExecute();
-                  }}
-                  disabled={executing || !canSponsor}
-                  className="p-1.5 bg-black border border-white/10 hover:border-green-500 hover:text-green-500 transition-all disabled:opacity-20 shadow-[2px_2px_0_#000]"
-                  title={
-                    !canSponsor
-                      ? 'Rebate does not cover gas + fee'
-                      : action.kind === 'merge_coins'
-                        ? 'MERGE COIN'
-                        : action.kind === 'destroy_zero'
-                          ? 'DESTROY COIN'
-                          : action.kind === 'close_kiosk'
-                            ? 'CLOSE KIOSK'
-                            : 'ATTEMPT BURN'
-                  }
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              )}
+              {interactive && (() => {
+                const label = !canSponsor
+                  ? 'Rebate does not cover gas + fee'
+                  : action.kind === 'merge_coins'
+                    ? `Merge coins ${shortLabel}`
+                    : action.kind === 'destroy_zero'
+                      ? `Destroy empty coin ${shortLabel}`
+                      : action.kind === 'close_kiosk'
+                        ? `Close kiosk ${shortLabel} — permanent`
+                        : `Burn ${shortLabel} — permanent and irreversible`;
+                return (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onExecute();
+                    }}
+                    disabled={executing || !canSponsor}
+                    className={cn(
+                      'p-1.5 bg-black border border-white/10 transition-all disabled:opacity-20 shadow-[2px_2px_0_#000]',
+                      isDestructive
+                        ? 'hover:border-red-500 hover:text-red-500'
+                        : 'hover:border-green-500 hover:text-green-500'
+                    )}
+                    title={label}
+                    aria-label={label}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                );
+              })()}
             </div>
           )}
         </div>

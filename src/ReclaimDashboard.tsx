@@ -5,10 +5,9 @@ import {
   ConnectButton as KitConnectButton,
 } from '@mysten/dapp-kit';
 import { useGraphQLScanner } from './useGraphQLScanner';
-import { buildBatchTransaction } from './buildCleanupTransaction';
-import { REBATE_MULTIPLIER, FEE_RECIPIENT } from './constants';
-import { computeFeeMist } from './buildCleanupTransaction';
-import { rpcClient } from './rpcClient';
+import { buildBatchTransaction, computeFeeMist } from './buildCleanupTransaction';
+import { simulateActions, executeActions } from './sponsoredTx';
+import { actionKey, actionDomId } from './actionIdentity';
 import type { CleanupAction } from './types';
 
 // ui components
@@ -19,7 +18,7 @@ import { Alert, AlertDescription } from './components/ui/alert';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from './utils/cn';
 import { X } from 'lucide-react';
-import { formatSui, bytesToBase64, base64ToBytes, shortLabelFromType, shortenAddress } from './utils/format';
+import { formatSui, shortLabelFromType, shortenAddress } from './utils/format';
 import { canRequestExplain, recordExplainRequest } from './utils/explain';
 import { ScanProgressPanel } from './components/ScanProgressPanel';
 import { WarningsBlock } from './components/WarningsBlock';
@@ -49,8 +48,6 @@ const itemVariants = {
   },
 };
 
-import { Transaction } from '@mysten/sui/transactions';
-import { graphQLClient } from './graphql/client';
 import { isSuiNSDomain, resolveSuiNSDomain } from './utils/suiNS';
 
 export function ReclaimDashboard() {
@@ -72,6 +69,9 @@ export function ReclaimDashboard() {
     if (!rawInput || !isSuiNSDomain(rawInput)) {
       setResolvedAddress(null);
       setSuiNSError(null);
+      // the input is no longer the name that was submitted, so drop the queued scan —
+      // otherwise it fires against whatever the user types next
+      scanAfterResolveRef.current = false;
       return;
     }
     let cancelled = false;
@@ -81,12 +81,16 @@ export function ReclaimDashboard() {
       .then((addr) => {
         if (cancelled) return;
         setResolvedAddress(addr);
-        if (!addr) setSuiNSError(`Could not resolve ${rawInput}`);
+        if (!addr) {
+          setSuiNSError(`Could not resolve ${rawInput}`);
+          scanAfterResolveRef.current = false;
+        }
       })
       .catch((err) => {
         if (!cancelled) {
           setSuiNSError(err?.message ?? 'Failed to resolve SuiNS domain');
           setResolvedAddress(null);
+          scanAfterResolveRef.current = false;
         }
       })
       .finally(() => {
@@ -98,6 +102,8 @@ export function ReclaimDashboard() {
   }, [rawInput]);
 
   const [executeError, setExecuteError] = React.useState<string | null>(null);
+  /** non-fatal follow-up (e.g. submitted but finality is slow) */
+  const [executeNotice, setExecuteNotice] = React.useState<string | null>(null);
   const [lastSponsorImpact, setLastSponsorImpact] = React.useState<{
     digest: string;
     netMist: number;
@@ -141,494 +147,187 @@ export function ReclaimDashboard() {
     error?: string;
   } | null>(null);
   /** per-action simulated net inflow (from balance changes); card shows this when set so it matches wallet */
-  const [simulatedNetInflowByIndex, setSimulatedNetInflowByIndex] = React.useState<Record<number, number>>({});
+  const [simulatedNetInflowByKey, setSimulatedNetInflowByKey] = React.useState<Record<string, number>>({});
   const [lastDryRunRawJson, setLastDryRunRawJson] = React.useState<string | null>(null);
   const [showRawSimulation, setShowRawSimulation] = React.useState(false);
   const [geminiExplanation, setGeminiExplanation] = React.useState<string | null>(null);
   const [geminiLoading, setGeminiLoading] = React.useState(false);
   const [geminiError, setGeminiError] = React.useState<string | null>(null);
   const [executing, setExecuting] = React.useState(false);
-  const [selectedActions, setSelectedActions] = React.useState<Set<number>>(new Set());
-  const toggleAction = (index: number) => {
-    setSelectedActions((prev) => {
+  const [simulating, setSimulating] = React.useState(false);
+  /** actions awaiting an explicit "yes, destroy these" before we ask the wallet to sign */
+  const [pendingConfirm, setPendingConfirm] = React.useState<CleanupAction[] | null>(null);
+  const simulationEpochRef = React.useRef(0);
+  // keyed by action identity, not list position: a re-scan reorders state.actions and
+  // positional keys would silently re-point the cart at different objects
+  const [selectedKeys, setSelectedKeys] = React.useState<Set<string>>(new Set());
+
+  const toggleAction = React.useCallback((key: string) => {
+    setSelectedKeys((prev) => {
       const next = new Set(prev);
-      if (next.has(index)) next.delete(index);
-      else next.add(index);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
-  };
+  }, []);
 
-  const selectedActionList = state.actions.filter((_, i) => selectedActions.has(i));
-  const totalSelectedRebateMist = selectedActionList.reduce((s, a) => s + a.userRebateMist, 0);
-  const totalStorageRebateMist = selectedActionList.reduce(
-    (s, a) => s + Number(a.storageRebateTotal),
-    0
+  const selectedActionList = React.useMemo(
+    () => state.actions.filter((a) => selectedKeys.has(actionKey(a))),
+    [state.actions, selectedKeys]
   );
-  const totalEstimatedGasMist = selectedActionList.reduce((s, a) => s + a.estimatedGasMist, 0);
-  const burnedMist = Math.floor(totalStorageRebateMist * (1 - REBATE_MULTIPLIER));
-  const feeMist = computeFeeMist(totalStorageRebateMist);
-  const canSponsorBatch = totalSelectedRebateMist >= totalEstimatedGasMist + feeMist;
 
-  const runDryRun = React.useCallback(async () => {
-    if (selectedActionList.length === 0) {
-      setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: 'Select at least one action.' });
-      return;
-    }
-    if (!account?.address) {
-      setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: 'Connect wallet to dry run.' });
-      return;
-    }
-    setDryRunResult(null);
+  // Planning the batch is the only honest source for these numbers: it accounts for the
+  // merge primary that survives and for anything the batch cap drops, which is exactly
+  // where the displayed total used to drift from what the transaction really does.
+  const batchPreview = React.useMemo(() => {
+    const senderAddress = account?.address ?? state.scannedAddress;
+    if (selectedActionList.length === 0 || !senderAddress) return null;
     try {
-      const estimatedGasMist = selectedActionList.reduce((s, a) => s + a.estimatedGasMist, 0);
-      const tx = buildBatchTransaction(
-        selectedActionList,
-        null,
-        totalStorageRebateMist,
-        null,
-        estimatedGasMist,
-        null,
-        { sponsoredGas: true, senderAddress: account.address }
-      );
-      tx.setSender(account.address);
-      tx.setGasOwner(FEE_RECIPIENT);
-      const kindBytes = await tx.build({ client: graphQLClient, onlyTransactionKind: true });
-      const txBytesBase64 = bytesToBase64(kindBytes instanceof Uint8Array ? kindBytes : new Uint8Array(kindBytes));
-
-      const sponsorRes = await fetch('/api/sponsor', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ txBytes: txBytesBase64, userAddress: account.address }),
+      // no gas figure: the build charges only for the actions that fit under the cap
+      return buildBatchTransaction(selectedActionList, {
+        sponsoredGas: true,
+        senderAddress,
       });
-      if (!sponsorRes.ok) {
-        const err = await sponsorRes.json().catch(() => ({}));
-        throw new Error(err?.error ?? `Sponsor API ${sponsorRes.status}`);
-      }
-      const { sponsoredTxBytes } = await sponsorRes.json();
-      if (!sponsoredTxBytes) throw new Error('Invalid sponsor response');
-
-      const sponsoredBytes = base64ToBytes(sponsoredTxBytes);
-      const result = await graphQLClient.simulateTransaction({
-        transaction: sponsoredBytes,
-        include: { effects: true },
-      });
-      setGeminiExplanation(null);
-      setGeminiError(null);
-      setLastDryRunRawJson(
-        JSON.stringify(
-          {
-            request: { transactionBytesBase64: sponsoredTxBytes, include: { effects: true } },
-            response: result,
-          },
-          null,
-          2
-        )
-      );
-      const effects =
-        result.$kind === 'Transaction' ? result.Transaction.effects : result.FailedTransaction?.effects;
-      if (!effects) {
-        setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: 'No effects from dry run.' });
-        return;
-      }
-      const gasUsed = effects.gasUsed;
-      const gasCostMist =
-        Number(gasUsed?.computationCost ?? 0) +
-        Number(gasUsed?.storageCost ?? 0) -
-        Number(gasUsed?.storageRebate ?? 0);
-      const netGainMist = totalSelectedRebateMist - Math.max(0, gasCostMist) - feeMist;
-      setDryRunResult({ netGainMist, gasCostMist, error: undefined });
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      setGeminiExplanation(null);
-      setGeminiError(null);
-      setLastDryRunRawJson(JSON.stringify({ request: null, response: { error: errMsg } }, null, 2));
-      setDryRunResult({
-        netGainMist: 0,
-        gasCostMist: 0,
-        error: errMsg,
-      });
+    } catch {
+      return null;
     }
-  }, [account?.address, selectedActionList, totalSelectedRebateMist, totalStorageRebateMist, feeMist]);
+  }, [selectedActionList, account?.address, state.scannedAddress]);
 
-  const execute = React.useCallback(async () => {
-    if (selectedActionList.length === 0 || !account?.address) return;
-    setExecuting(true);
-    setExecuteError(null);
-    setLastSponsorImpact(null);
-    const clearExecuting = () => setExecuting(false);
-    const safetyTimeoutId = setTimeout(clearExecuting, 120_000);
-    try {
-      const estimatedGasMist = selectedActionList.reduce((s, a) => s + a.estimatedGasMist, 0);
-      // 1) Build with estimated gas, sponsor, dry run to get actual gas cost
-      const txDraft = buildBatchTransaction(
-        selectedActionList,
-        null,
-        totalStorageRebateMist,
-        null,
-        estimatedGasMist,
-        null,
-        { sponsoredGas: true, senderAddress: account.address }
-      );
-      txDraft.setSender(account.address);
-      txDraft.setGasOwner(FEE_RECIPIENT);
-      const kindBytesDraft = await txDraft.build({ client: graphQLClient, onlyTransactionKind: true });
-      const txBytesBase64Draft = bytesToBase64(kindBytesDraft instanceof Uint8Array ? kindBytesDraft : new Uint8Array(kindBytesDraft));
+  const totalSelectedRebateMist = batchPreview?.userRebateMist ?? 0;
+  const totalStorageRebateMist = batchPreview?.storageRebateMist ?? 0;
+  const totalEstimatedGasMist = batchPreview?.gasMist ?? 0;
+  const burnedMist = totalStorageRebateMist - totalSelectedRebateMist;
+  const feeMist = batchPreview?.feeMist ?? 0;
+  const userShareMist = batchPreview?.userShareMist ?? 0;
+  const droppedActionCount = batchPreview?.droppedActionCount ?? 0;
+  const canSponsorBatch = batchPreview != null && batchPreview.userShareMist >= 0;
 
-      const sponsorRes1 = await fetch('/api/sponsor', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ txBytes: txBytesBase64Draft, userAddress: account.address }),
-      });
-      if (!sponsorRes1.ok) {
-        const err = await sponsorRes1.json().catch(() => ({}));
-        throw new Error(err?.error ?? `Sponsor API ${sponsorRes1.status}`);
-      }
-      const { sponsoredTxBytes: sponsoredDraft } = await sponsorRes1.json();
-      if (!sponsoredDraft) throw new Error('Invalid sponsor response');
-
-      const simResult = await graphQLClient.simulateTransaction({
-        transaction: base64ToBytes(sponsoredDraft),
-        include: { effects: true },
-      });
-      const simEffects = (simResult.$kind === 'Transaction' ? simResult.Transaction : simResult.FailedTransaction)?.effects;
-      if (!simEffects?.gasUsed) throw new Error('Dry run failed or no gas data');
-      const gasCostMist =
-        Number(simEffects.gasUsed?.computationCost ?? 0) +
-        Number(simEffects.gasUsed?.storageCost ?? 0) -
-        Number(simEffects.gasUsed?.storageRebate ?? 0);
-      const gasRecoupMist =
-        gasCostMist > 0 ? gasCostMist : estimatedGasMist;
-      if (totalSelectedRebateMist < gasRecoupMist + feeMist) {
-        setExecuteError(
-          'Selected actions don\'t cover gas and fee (simulation showed gas cost higher than rebate). We don\'t sponsor losing transactions.'
-        );
-        return;
-      }
-
-      // 2) Rebuild with actual gas so we recoup what we spend (fallback to estimate when sim says <= 0)
-      const tx = buildBatchTransaction(
-        selectedActionList,
-        null,
-        totalStorageRebateMist,
-        null,
-        gasRecoupMist,
-        null,
-        { sponsoredGas: true, senderAddress: account.address }
-      );
-      tx.setSender(account.address);
-      tx.setGasOwner(FEE_RECIPIENT);
-      const kindBytes = await tx.build({ client: graphQLClient, onlyTransactionKind: true });
-      const txBytesBase64 = bytesToBase64(kindBytes instanceof Uint8Array ? kindBytes : new Uint8Array(kindBytes));
-
-      const sponsorRes = await fetch('/api/sponsor', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ txBytes: txBytesBase64, userAddress: account.address }),
-      });
-      if (!sponsorRes.ok) {
-        const err = await sponsorRes.json().catch(() => ({}));
-        throw new Error(err?.error ?? `Sponsor API ${sponsorRes.status}`);
-      }
-      const { sponsoredTxBytes, sponsorSignature } = await sponsorRes.json();
-      if (!sponsoredTxBytes || !sponsorSignature) throw new Error('Invalid sponsor response');
-
-      const txToSign = Transaction.from(sponsoredTxBytes);
-      const { bytes: signedTxBytes, signature: userSignature } = await signTransaction({
-        transaction: txToSign,
-      });
-
-      const result = await rpcClient.executeTransactionBlock({
-        transactionBlock: signedTxBytes,
-        signature: [sponsorSignature, userSignature],
-        options: { showEffects: true },
-      });
-      setDryRunResult(null);
-      const executedActions = [...selectedActionList];
-      setSelectedActions(new Set());
-      if (result.digest) {
-        await rpcClient.waitForTransaction({
-          digest: result.digest,
-          timeout: 30_000,
-          pollInterval: 500,
-        });
-        try {
-          const txResp = await rpcClient.getTransactionBlock({
-            digest: result.digest,
-            options: { showBalanceChanges: true },
-          });
-          const changes = txResp.balanceChanges ?? [];
-          const sponsorNorm = FEE_RECIPIENT.toLowerCase();
-          const ownerAddr = (o: typeof changes[0]['owner']) =>
-            o && typeof o === 'object' && 'AddressOwner' in o ? (o as { AddressOwner: string }).AddressOwner : null;
-          const isSui = (t: string) => t != null && /^0x0*2::sui::sui$/i.test(t.replace(/^0x0+/, '0x'));
-          let netMist = 0;
-          for (const ch of changes) {
-            const addr = ownerAddr(ch.owner);
-            if (addr?.toLowerCase() === sponsorNorm && isSui(ch.coinType)) {
-              const amt = Number(ch.amount);
-              if (!Number.isNaN(amt)) netMist += amt;
-            }
-          }
-          setLastSponsorImpact({ digest: result.digest, netMist });
-        } catch {
-          setLastSponsorImpact(null);
-        }
-      }
-      await refreshAfterExecute(executedActions);
-      setSimulatedNetInflowByIndex({});
-    } catch (e) {
-      setExecuteError(e instanceof Error ? e.message : String(e));
-    } finally {
-      clearTimeout(safetyTimeoutId);
-      clearExecuting();
-    }
-  }, [account?.address, selectedActionList, signTransaction, refreshAfterExecute, totalStorageRebateMist]);
-
-  const runDryRunOne = React.useCallback(
-    async (action: CleanupAction, actionIndex: number) => {
+  // One simulate path and one execute path, both taking the actions to act on. These
+  // were four near-identical copies; the transaction plumbing now lives in sponsoredTx.
+  const runSimulation = React.useCallback(
+    async (actions: CleanupAction[], forKey?: string) => {
       const senderAddress = account?.address ?? state.scannedAddress ?? null;
       if (!senderAddress) {
         setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: 'Scan an address or connect wallet to run simulation.' });
         return;
       }
+      if (actions.length === 0) {
+        setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: 'Select at least one action.' });
+        return;
+      }
+      const epoch = ++simulationEpochRef.current;
+      setSimulating(true);
       setDryRunResult(null);
+      setGeminiExplanation(null);
+      setGeminiError(null);
       try {
-        const singleStorageRebate = Number(action.storageRebateTotal);
-        const tx = buildBatchTransaction(
-          [action],
-          null,
-          singleStorageRebate,
-          null,
-          action.estimatedGasMist,
-          null,
-          { sponsoredGas: true, senderAddress }
-        );
-        tx.setSender(senderAddress);
-        tx.setGasOwner(FEE_RECIPIENT);
-        const kindBytes = await tx.build({ client: graphQLClient, onlyTransactionKind: true });
-        const txBytesBase64 = bytesToBase64(kindBytes instanceof Uint8Array ? kindBytes : new Uint8Array(kindBytes));
-
-        const sponsorRes = await fetch('/api/sponsor', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ txBytes: txBytesBase64, userAddress: senderAddress }),
+        const outcome = await simulateActions(actions, senderAddress);
+        // a newer simulation (or a selection change) supersedes this result
+        if (simulationEpochRef.current !== epoch) return;
+        setLastDryRunRawJson(outcome.rawJson);
+        const error = outcome.success
+          ? undefined
+          : outcome.executionError ?? 'Transaction would fail on-chain.';
+        setDryRunResult({
+          netGainMist: outcome.netGainMist,
+          gasCostMist: outcome.gasCostMist,
+          error,
         });
-        if (!sponsorRes.ok) {
-          const err = await sponsorRes.json().catch(() => ({}));
-          throw new Error(err?.error ?? `Sponsor API ${sponsorRes.status}`);
-        }
-        const { sponsoredTxBytes } = await sponsorRes.json();
-        if (!sponsoredTxBytes) throw new Error('Invalid sponsor response');
-
-        const sponsoredBytes = base64ToBytes(sponsoredTxBytes);
-        const result = await graphQLClient.simulateTransaction({
-          transaction: sponsoredBytes,
-          include: { effects: true, balanceChanges: true },
-        });
-        setGeminiExplanation(null);
-        setGeminiError(null);
-        setLastDryRunRawJson(
-          JSON.stringify(
-            {
-              request: { transactionBytesBase64: sponsoredTxBytes, include: { effects: true, balanceChanges: true } },
-              response: result,
-            },
-            null,
-            2
-          )
-        );
-        const txResult = result.$kind === 'Transaction' ? result.Transaction : result.FailedTransaction;
-        const effects = txResult?.effects;
-        if (!effects) {
-          setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: 'No effects from dry run.' });
-          setSimulationModal({ error: 'No effects from dry run.' });
-          return;
-        }
-        const gasUsed = effects.gasUsed;
-        const gasCostMist =
-          Number(gasUsed?.computationCost ?? 0) +
-          Number(gasUsed?.storageCost ?? 0) -
-          Number(gasUsed?.storageRebate ?? 0);
-        const singleFeeMist = computeFeeMist(singleStorageRebate);
-        const netGainMist = action.userRebateMist - Math.max(0, gasCostMist) - singleFeeMist;
-        let netInflowMist: number | undefined;
-        const balanceChanges = txResult.balanceChanges;
-        if (balanceChanges && senderAddress) {
-          const senderNorm = senderAddress.toLowerCase();
-          // SUI type can be 0x2::sui::SUI or long form 0x0...02::sui::SUI
-          const isSuiCoinType = (t: string | undefined) =>
-            t != null && /^0x0*2::sui::sui$/i.test(t.replace(/^0x0+/, '0x'));
-          for (const ch of balanceChanges) {
-            if (ch.address?.toLowerCase() === senderNorm && isSuiCoinType(ch.coinType)) {
-              const amount = Number(ch.amount);
-              if (!Number.isNaN(amount)) netInflowMist = (netInflowMist ?? 0) + amount;
-            }
+        const expectedInflowMist =
+          outcome.netInflowMist ??
+          (outcome.gasCostMist <= 0 ? -outcome.gasCostMist : undefined) ??
+          outcome.netGainMist;
+        if (forKey) {
+          setSimulationModal({
+            netGainMist: outcome.netGainMist,
+            netInflowMist: expectedInflowMist,
+            gasCostMist: outcome.gasCostMist,
+            error,
+          });
+          if (!error) {
+            setSimulatedNetInflowByKey((prev) => ({ ...prev, [forKey]: expectedInflowMist }));
           }
         }
-        const expectedInflowMist =
-          netInflowMist ?? (gasCostMist <= 0 ? -gasCostMist : undefined) ?? netGainMist;
-        setDryRunResult({ netGainMist, gasCostMist, error: undefined });
-        setSimulationModal({
-          netGainMist,
-          netInflowMist: expectedInflowMist,
-          gasCostMist,
-          error: undefined,
-        });
-        setSimulatedNetInflowByIndex((prev) => ({ ...prev, [actionIndex]: expectedInflowMist }));
       } catch (e) {
+        if (simulationEpochRef.current !== epoch) return;
         const errMsg = e instanceof Error ? e.message : String(e);
-        setGeminiExplanation(null);
-        setGeminiError(null);
         setLastDryRunRawJson(JSON.stringify({ request: null, response: { error: errMsg } }, null, 2));
         setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: errMsg });
-        setSimulationModal({ error: errMsg });
+        if (forKey) setSimulationModal({ error: errMsg });
+      } finally {
+        if (simulationEpochRef.current === epoch) setSimulating(false);
       }
     },
     [account?.address, state.scannedAddress]
   );
 
-  // clear simulated yields when scan results change so we don't show stale numbers
-  React.useEffect(() => {
-    setSimulatedNetInflowByIndex({});
-  }, [state.scannedAddress, state.actions.length]);
-
-  const executeOne = React.useCallback(
-    async (action: CleanupAction) => {
-      if (!account?.address) return;
+  const performExecute = React.useCallback(
+    async (actions: CleanupAction[]) => {
+      if (actions.length === 0) return;
+      if (!account?.address) {
+        setExecuteError('Connect your wallet before executing.');
+        return;
+      }
       setExecuting(true);
       setExecuteError(null);
+      setExecuteNotice(null);
       setLastSponsorImpact(null);
-      const clearExecuting = () => setExecuting(false);
-      const safetyTimeoutId = setTimeout(clearExecuting, 120_000);
       try {
-        const singleStorageRebate = Number(action.storageRebateTotal);
-        // 1) Build with estimated gas, sponsor, dry run to get actual gas cost
-        const txDraft = buildBatchTransaction(
-          [action],
-          null,
-          singleStorageRebate,
-          null,
-          action.estimatedGasMist,
-          null,
-          { sponsoredGas: true, senderAddress: account.address }
-        );
-        txDraft.setSender(account.address);
-        txDraft.setGasOwner(FEE_RECIPIENT);
-        const kindBytesDraft = await txDraft.build({ client: graphQLClient, onlyTransactionKind: true });
-        const txBytesBase64Draft = bytesToBase64(kindBytesDraft instanceof Uint8Array ? kindBytesDraft : new Uint8Array(kindBytesDraft));
-
-        const sponsorRes1 = await fetch('/api/sponsor', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ txBytes: txBytesBase64Draft, userAddress: account.address }),
-        });
-        if (!sponsorRes1.ok) {
-          const err = await sponsorRes1.json().catch(() => ({}));
-          throw new Error(err?.error ?? `Sponsor API ${sponsorRes1.status}`);
-        }
-        const { sponsoredTxBytes: sponsoredDraft } = await sponsorRes1.json();
-        if (!sponsoredDraft) throw new Error('Invalid sponsor response');
-
-        const simResult = await graphQLClient.simulateTransaction({
-          transaction: base64ToBytes(sponsoredDraft),
-          include: { effects: true },
-        });
-        const simEffects = (simResult.$kind === 'Transaction' ? simResult.Transaction : simResult.FailedTransaction)?.effects;
-        if (!simEffects?.gasUsed) throw new Error('Dry run failed or no gas data');
-        const gasCostMist =
-          Number(simEffects.gasUsed?.computationCost ?? 0) +
-          Number(simEffects.gasUsed?.storageCost ?? 0) -
-          Number(simEffects.gasUsed?.storageRebate ?? 0);
-        const gasRecoupMist =
-          gasCostMist > 0 ? gasCostMist : action.estimatedGasMist;
-        const singleFeeMist = computeFeeMist(singleStorageRebate);
-        if (action.userRebateMist < gasRecoupMist + singleFeeMist) {
-          setExecuteError(
-            'This action doesn\'t cover gas and fee (simulation showed gas cost higher than rebate). We don\'t sponsor losing transactions.'
-          );
-          return;
-        }
-
-        // 2) Rebuild with actual gas so we recoup what we spend (fallback to estimate when sim says <= 0)
-        const tx = buildBatchTransaction(
-          [action],
-          null,
-          singleStorageRebate,
-          null,
-          gasRecoupMist,
-          null,
-          { sponsoredGas: true, senderAddress: account.address }
-        );
-        tx.setSender(account.address);
-        tx.setGasOwner(FEE_RECIPIENT);
-        const kindBytes = await tx.build({ client: graphQLClient, onlyTransactionKind: true });
-        const txBytesBase64 = bytesToBase64(kindBytes instanceof Uint8Array ? kindBytes : new Uint8Array(kindBytes));
-
-        const sponsorRes = await fetch('/api/sponsor', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ txBytes: txBytesBase64, userAddress: account.address }),
-        });
-        if (!sponsorRes.ok) {
-          const err = await sponsorRes.json().catch(() => ({}));
-          throw new Error(err?.error ?? `Sponsor API ${sponsorRes.status}`);
-        }
-        const { sponsoredTxBytes, sponsorSignature } = await sponsorRes.json();
-        if (!sponsoredTxBytes || !sponsorSignature) throw new Error('Invalid sponsor response');
-
-        const txToSign = Transaction.from(sponsoredTxBytes);
-        const { bytes: signedTxBytes, signature: userSignature } = await signTransaction({
-          transaction: txToSign,
-        });
-
-        const result = await rpcClient.executeTransactionBlock({
-          transactionBlock: signedTxBytes,
-          signature: [sponsorSignature, userSignature],
-          options: { showEffects: true },
-        });
+        const outcome = await executeActions(actions, account.address, signTransaction);
         setDryRunResult(null);
-        const executedActions = [action];
-        setSelectedActions(new Set());
-        if (result.digest) {
-          await rpcClient.waitForTransaction({
-            digest: result.digest,
-            timeout: 30_000,
-            pollInterval: 500,
-          });
-          try {
-            const txResp = await rpcClient.getTransactionBlock({
-              digest: result.digest,
-              options: { showBalanceChanges: true },
-            });
-            const changes = txResp.balanceChanges ?? [];
-            const sponsorNorm = FEE_RECIPIENT.toLowerCase();
-            const ownerAddr = (o: typeof changes[0]['owner']) =>
-              o && typeof o === 'object' && 'AddressOwner' in o ? (o as { AddressOwner: string }).AddressOwner : null;
-            const isSui = (t: string) => t != null && /^0x0*2::sui::sui$/i.test(t.replace(/^0x0+/, '0x'));
-            let netMist = 0;
-            for (const ch of changes) {
-              const addr = ownerAddr(ch.owner);
-              if (addr?.toLowerCase() === sponsorNorm && isSui(ch.coinType)) {
-                const amt = Number(ch.amount);
-                if (!Number.isNaN(amt)) netMist += amt;
-              }
-            }
-            setLastSponsorImpact({ digest: result.digest, netMist });
-          } catch {
-            setLastSponsorImpact(null);
-          }
+        // drop only what was executed, so running one card does not empty the whole queue
+        const executedKeys = new Set(outcome.executedActions.map(actionKey));
+        setSelectedKeys((prev) => new Set([...prev].filter((k) => !executedKeys.has(k))));
+        setSimulatedNetInflowByKey((prev) => {
+          const next = { ...prev };
+          executedKeys.forEach((k) => delete next[k]);
+          return next;
+        });
+        if (outcome.sponsorNetMist != null) {
+          setLastSponsorImpact({ digest: outcome.digest, netMist: outcome.sponsorNetMist });
         }
-        await refreshAfterExecute(executedActions);
-        setSimulatedNetInflowByIndex({});
+        if (outcome.pending) {
+          setExecuteNotice(
+            'Submitted, but finality is taking a while. Check the explorer if your balance has not updated.'
+          );
+        }
+        await refreshAfterExecute(outcome.executedActions);
       } catch (e) {
         setExecuteError(e instanceof Error ? e.message : String(e));
       } finally {
-        clearTimeout(safetyTimeoutId);
-        clearExecuting();
+        // no safety timer: this always runs, and a timer that fires mid-signing would
+        // re-enable Execute and let a second transaction race the first over the same objects
+        setExecuting(false);
       }
     },
     [account?.address, signTransaction, refreshAfterExecute]
   );
+
+  // burns and kiosk closes are irreversible, so they get an explicit confirmation
+  // instead of going straight from one icon click to a wallet signature prompt
+  const requestExecute = React.useCallback(
+    (actions: CleanupAction[]) => {
+      // a second flow over the same objects can equivocate them, so one at a time
+      if (actions.length === 0 || executing) return;
+      const destructive = actions.some((a) => a.kind === 'burn' || a.kind === 'close_kiosk');
+      if (destructive) setPendingConfirm(actions);
+      else void performExecute(actions);
+    },
+    [performExecute, executing]
+  );
+
+  // clear simulated yields when scan results change so we don't show stale numbers
+  React.useEffect(() => {
+    setSimulatedNetInflowByKey({});
+  }, [state.scannedAddress, state.actions]);
+
+  // a simulation belongs to the selection it was run for; changing the queue invalidates
+  // it, and bumping the epoch stops an in-flight one from landing afterwards
+  React.useEffect(() => {
+    simulationEpochRef.current += 1;
+    setSimulating(false);
+    setDryRunResult(null);
+  }, [selectedKeys]);
 
   const feedSkitty = React.useCallback(async () => {
     const raw = lastDryRunRawJson ?? '';
@@ -670,10 +369,10 @@ export function ReclaimDashboard() {
   }, [lastDryRunRawJson]);
 
   const actionsByKind = React.useMemo(() => {
-    const map = new Map<CleanupAction['kind'], { action: CleanupAction; index: number }[]>();
-    state.actions.forEach((action, index) => {
+    const map = new Map<CleanupAction['kind'], { action: CleanupAction; key: string }[]>();
+    state.actions.forEach((action) => {
       const list = map.get(action.kind) ?? [];
-      list.push({ action, index });
+      list.push({ action, key: actionKey(action) });
       map.set(action.kind, list);
     });
     return map;
@@ -703,15 +402,13 @@ export function ReclaimDashboard() {
 
   const selectAllForKind = (kind: CleanupAction['kind']) => {
     const items = actionsByKind.get(kind) ?? [];
-    const indices = new Set(items.map(({ index }) => index));
-    setSelectedActions((prev) => {
-      const allSelected = indices.size > 0 && [...indices].every((i: number) => prev.has(i));
-      if (allSelected) {
-        const next = new Set(prev);
-        indices.forEach((i) => next.delete(i));
-        return next;
-      }
-      return new Set([...prev, ...indices]);
+    const keys = items.map(({ key }) => key);
+    setSelectedKeys((prev) => {
+      const allSelected = keys.length > 0 && keys.every((k) => prev.has(k));
+      const next = new Set(prev);
+      if (allSelected) keys.forEach((k) => next.delete(k));
+      else keys.forEach((k) => next.add(k));
+      return next;
     });
   };
 
@@ -722,8 +419,17 @@ export function ReclaimDashboard() {
   );
 
   React.useEffect(() => {
-    if (!scannedAddressIsConnectedWallet) setSelectedActions(new Set());
+    if (!scannedAddressIsConnectedWallet) setSelectedKeys(new Set());
   }, [scannedAddressIsConnectedWallet]);
+
+  // drop selections whose action no longer exists after a re-scan or refresh
+  React.useEffect(() => {
+    const live = new Set(state.actions.map(actionKey));
+    setSelectedKeys((prev) => {
+      const next = new Set([...prev].filter((k) => live.has(k)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [state.actions]);
 
   return (
     <div className="min-h-screen flex flex-col bg-black font-body text-white selection:bg-skitty-accent selection:text-white">
@@ -868,6 +574,37 @@ export function ReclaimDashboard() {
 
         <WarningsBlock />
 
+        {/* the cart unmounts once a queue clears, so execution failures need a home on the page too */}
+        <AnimatePresence>
+          {executeError && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              key="execute-error"
+            >
+              <Alert variant="destructive" className="border-2 border-black rounded-none">
+                <AlertDescription>
+                  <span className="font-black uppercase tracking-widest">Execution failed: </span>
+                  {executeError}
+                </AlertDescription>
+              </Alert>
+            </motion.div>
+          )}
+          {executeNotice && !executeError && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              key="execute-notice"
+            >
+              <Alert className="border-2 border-black rounded-none bg-amber-400 text-black">
+                <AlertDescription>{executeNotice}</AlertDescription>
+              </Alert>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {(state.loading || state.scanProgress != null) && (
           <ScanProgressPanel
             progress={state.scanProgress}
@@ -926,21 +663,22 @@ export function ReclaimDashboard() {
                       </div>
                     </div>
                     <ul className="action-panel-scroll overflow-y-auto flex-1 min-h-0 p-4 space-y-4 max-h-[450px]">
-                      {items.map(({ action, index }) => (
+                      {items.map(({ action, key }) => (
                         <ActionCard
-                          key={index}
+                          key={key}
                           action={action}
-                          index={index}
-                          selected={selectedActions.has(index)}
-                          onToggle={() => toggleAction(index)}
+                          domId={actionDomId(action)}
+                          selected={selectedKeys.has(key)}
+                          onToggle={() => toggleAction(key)}
                           shortLabel={shortLabelFromType(action.label ?? action.objectIds[0] ?? '')}
                           notEconomical={action.netGainMist < 0}
                           interactive={scannedAddressIsConnectedWallet}
                           showSimulate
-                          simulatedNetInflowMist={simulatedNetInflowByIndex[index]}
-                          onDryRun={() => runDryRunOne(action, index)}
-                          onExecute={() => executeOne(action)}
+                          simulatedNetInflowMist={simulatedNetInflowByKey[key]}
+                          onDryRun={() => runSimulation([action], key)}
+                          onExecute={() => requestExecute([action])}
                           executing={executing}
+                          simulating={simulating}
                           canSponsor={
                             action.userRebateMist >=
                             action.estimatedGasMist + computeFeeMist(Number(action.storageRebateTotal))
@@ -974,7 +712,7 @@ export function ReclaimDashboard() {
       </main>
 
       <AnimatePresence>
-        {scannedAddressIsConnectedWallet && selectedActions.size > 0 && (
+        {scannedAddressIsConnectedWallet && selectedKeys.size > 0 && (
           <motion.div
             initial={{ y: 100, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
@@ -983,16 +721,21 @@ export function ReclaimDashboard() {
           >
             <FloatingCart
               selectedActionList={selectedActionList}
-              totalSelectedRebateMist={totalSelectedRebateMist}
+              storageRebateMist={totalStorageRebateMist}
               burnedMist={burnedMist}
               feeMist={feeMist}
+              estimatedGasMist={totalEstimatedGasMist}
+              userShareMist={userShareMist}
+              droppedActionCount={droppedActionCount}
               dryRunResult={dryRunResult}
               executeError={executeError}
-              runDryRun={runDryRun}
-              execute={execute}
-              onClearQueue={() => setSelectedActions(new Set())}
+              executeNotice={executeNotice}
+              runDryRun={() => runSimulation(selectedActionList)}
+              execute={() => requestExecute(selectedActionList)}
+              onClearQueue={() => setSelectedKeys(new Set())}
               onViewRawSimulation={() => setShowRawSimulation(true)}
               executing={executing}
+              simulating={simulating}
               accountConnected={!!account?.address}
               canSponsor={canSponsorBatch}
               lastSponsorImpact={lastSponsorImpact}
@@ -1092,6 +835,97 @@ export function ReclaimDashboard() {
           </div>
         </div>
       </footer>
+
+      <AnimatePresence>
+        {pendingConfirm !== null && (() => {
+          const destructive = pendingConfirm.filter(
+            (a) => a.kind === 'burn' || a.kind === 'close_kiosk'
+          );
+          const objectCount = destructive.reduce((s, a) => s + a.objectIds.length, 0);
+          const kioskProfitsMist = destructive.reduce(
+            (s, a) => s + (a.kind === 'close_kiosk' ? a.profitsMist ?? 0 : 0),
+            0
+          );
+          const hasDiscovered = destructive.some((a) => a.kind === 'burn' && a.discovered);
+          return (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/80"
+              onClick={() => setPendingConfirm(null)}
+            >
+              <motion.div
+                initial={{ scale: 0.95 }}
+                animate={{ scale: 1 }}
+                exit={{ scale: 0.95 }}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="confirm-destroy-title"
+                className="bg-black border-3 border-red-500 shadow-[8px_8px_0_#000] p-6 max-w-md w-full"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <h3
+                  id="confirm-destroy-title"
+                  className="font-display font-black text-xl uppercase tracking-tighter text-red-400 mb-3"
+                >
+                  Permanently destroy {objectCount} object{objectCount === 1 ? '' : 's'}?
+                </h3>
+                <p className="text-sm text-skitty-secondary mb-4 leading-relaxed">
+                  This cannot be undone. These objects are gone for good once the transaction lands —
+                  including any in-game progress, airdrop eligibility, or collectible value they carry.
+                </p>
+                <ul className="action-panel-scroll max-h-[180px] overflow-y-auto mb-4 space-y-1 border-2 border-white/10 p-3">
+                  {destructive.map((a) => (
+                    <li
+                      key={actionKey(a)}
+                      className="text-[10px] font-black uppercase tracking-widest text-white flex justify-between gap-3"
+                    >
+                      <span className="truncate" title={a.label ?? ''}>
+                        {a.kind === 'close_kiosk' ? 'CLOSE KIOSK ' : 'BURN '}
+                        {shortLabelFromType(a.label ?? a.objectIds[0] ?? '')}
+                      </span>
+                      <span className="shrink-0 text-skitty-secondary/70">
+                        {a.objectIds.length} obj
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                {hasDiscovered && (
+                  <p className="text-[10px] font-black uppercase tracking-widest text-amber-400 mb-3 leading-relaxed">
+                    Some of these burn functions were auto-discovered by name, not verified. Skitty
+                    cannot tell a spam token from a valuable NFT — check them yourself first.
+                  </p>
+                )}
+                {kioskProfitsMist > 0 && (
+                  <p className="text-[10px] font-black uppercase tracking-widest text-skitty-accent mb-3">
+                    {formatSui(kioskProfitsMist)} SUI of kiosk profits will be paid out to you.
+                  </p>
+                )}
+                <div className="flex gap-3">
+                  <Button
+                    variant="outline"
+                    className="flex-1 h-12"
+                    onClick={() => setPendingConfirm(null)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    className="flex-1 h-12 bg-red-500 text-black hover:bg-red-400"
+                    onClick={() => {
+                      const actions = pendingConfirm;
+                      setPendingConfirm(null);
+                      void performExecute(actions);
+                    }}
+                  >
+                    Destroy them
+                  </Button>
+                </div>
+              </motion.div>
+            </motion.div>
+          );
+        })()}
+      </AnimatePresence>
 
       <AnimatePresence>
         {simulationModal !== null && (

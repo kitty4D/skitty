@@ -1,14 +1,14 @@
 import * as React from "react"
 import { cva, type VariantProps } from "class-variance-authority"
-import { cn } from "./utils"
+import { cn } from "../../utils/cn"
 
 const alertVariants = cva(
   "relative rounded-skitty-lg border p-4 [&>svg+div]:translate-y-[-3px] [&>svg]:absolute [&>svg]:left-4 [&>svg]:top-4 [&>svg]:text-foreground [&>svg~*]:pl-7",
   {
     variants: {
       variant: {
-        default: "border-skitty-peach/50 bg-white text-skitty-dark",
-        destructive: "border-red-500/50 text-red-900 bg-red-50/80",
+        default: "border-skitty-border bg-skitty-card text-skitty-primary",
+        destructive: "border-red-500/50 text-red-400 bg-red-500/10",
         warning: "border-amber-200 bg-amber-50/80 text-amber-900",
         success: "border-green-500/50 text-green-900 bg-green-50/80",
       },

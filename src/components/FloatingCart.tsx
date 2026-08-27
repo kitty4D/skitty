@@ -3,19 +3,26 @@ import { Trash2, ChevronDown, ChevronUp, PartyPopper } from 'lucide-react';
 import { Button } from './ui/button';
 import { computeFeeMist } from '../buildCleanupTransaction';
 import { formatSui, shortLabelFromType } from '../utils/format';
+import { actionKey } from '../actionIdentity';
 import type { CleanupAction } from '../types';
 
 export function FloatingCart({
   selectedActionList,
-  totalSelectedRebateMist,
+  storageRebateMist,
   burnedMist,
+  feeMist,
+  estimatedGasMist,
+  userShareMist,
+  droppedActionCount = 0,
   dryRunResult,
   executeError,
+  executeNotice = null,
   runDryRun,
   execute,
   onClearQueue,
   onViewRawSimulation,
   executing,
+  simulating = false,
   accountConnected,
   canSponsor = true,
   lastSponsorImpact = null,
@@ -23,16 +30,25 @@ export function FloatingCart({
   onToggleMinimize,
 }: {
   selectedActionList: CleanupAction[];
-  totalSelectedRebateMist: number;
+  /** gross storage rebate this batch actually reclaims */
+  storageRebateMist: number;
   burnedMist: number;
+  /** 13.69% service fee this transaction will actually charge */
   feeMist: number;
+  estimatedGasMist: number;
+  /** SUI the user receives after fee and gas */
+  userShareMist: number;
+  /** actions the batch cap left out of this transaction */
+  droppedActionCount?: number;
   dryRunResult: { netGainMist: number; gasCostMist: number; error?: string } | null;
   executeError: string | null;
+  executeNotice?: string | null;
   runDryRun: () => void;
   execute: () => void;
   onClearQueue: () => void;
   onViewRawSimulation: () => void;
   executing: boolean;
+  simulating?: boolean;
   accountConnected: boolean;
   /** false when rebate does not cover gas + fee; we do not sponsor */
   canSponsor?: boolean;
@@ -83,11 +99,11 @@ export function FloatingCart({
             </div>
 
             <div className="action-panel-scroll overflow-y-auto max-h-[180px] mb-6 space-y-2 pr-2">
-              {selectedActionList.map((action, i) => (
+              {selectedActionList.map((action) => (
                 <motion.div
                   initial={{ x: -10, opacity: 0 }}
                   animate={{ x: 0, opacity: 1 }}
-                  key={i}
+                  key={actionKey(action)}
                   className="text-[10px] font-black uppercase tracking-widest text-skitty-secondary flex justify-between gap-4 py-1 border-b border-white/5"
                 >
                   <span className="truncate max-w-[200px]" title={action.label ?? action.objectIds[0]}>
@@ -99,17 +115,40 @@ export function FloatingCart({
             </div>
 
             <div className="space-y-4 pt-2">
+              {/* Reads top to bottom as one sum: gross storage rebate, minus each
+                  deduction, equals the headline. The headline used to show the gross
+                  rebate, which overstated the payout by the fee and gas. */}
               <div className="border-t-2 border-skitty-accent pt-4 space-y-2">
-                <div className="flex justify-between items-start">
+                <div className="flex justify-between items-start gap-4">
                   <div>
-                    <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">TOTAL REBATE (99%)</p>
-                    <p className="text-4xl font-black text-white tracking-tighter leading-none mt-1">{formatSui(totalSelectedRebateMist)} SUI</p>
+                    <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">YOU RECEIVE (EST.)</p>
+                    <p className="text-4xl font-black text-white tracking-tighter leading-none mt-1">{formatSui(userShareMist)} SUI</p>
                   </div>
-                  <div className="text-right">
-                    <p className="text-sm font-black text-red-500 uppercase tracking-widest">PROTOCOL BURN (1%)</p>
-                    <p className="text-sm font-black text-red-500/80 tracking-tighter mt-0">-{formatSui(burnedMist)} SUI</p>
+                  <div className="text-right space-y-1 shrink-0">
+                    <div>
+                      <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">Storage rebate</p>
+                      <p className="text-xs font-black text-white tracking-tighter">{formatSui(storageRebateMist)} SUI</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] font-black text-red-500 uppercase tracking-widest">Protocol burn (1%)</p>
+                      <p className="text-xs font-black text-red-500/80 tracking-tighter">-{formatSui(burnedMist)} SUI</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] font-black text-amber-400 uppercase tracking-widest">Service fee (13.69%)</p>
+                      <p className="text-xs font-black text-amber-400/80 tracking-tighter">-{formatSui(feeMist)} SUI</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">Gas (est.)</p>
+                      <p className="text-xs font-black text-skitty-secondary/80 tracking-tighter">-{formatSui(estimatedGasMist)} SUI</p>
+                    </div>
                   </div>
                 </div>
+                {droppedActionCount > 0 && (
+                  <p className="text-[10px] font-black text-amber-400 uppercase tracking-widest leading-snug">
+                    Some selected objects won&apos;t fit in one transaction and are not included
+                    above — run another purge afterwards to clear the rest.
+                  </p>
+                )}
               </div>
 
               {dryRunResult && (
@@ -152,6 +191,12 @@ export function FloatingCart({
                 </div>
               )}
 
+              {executeNotice && !executeError && (
+                <div className="bg-amber-400 border-2 border-black p-3 shadow-[4px_4px_0_#000]">
+                  <p className="text-[10px] font-black text-black uppercase tracking-widest">{executeNotice}</p>
+                </div>
+              )}
+
               {lastSponsorImpact != null && (
                 <div className="bg-white/10 border border-white/20 p-2">
                   <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">Sponsor net last tx</p>
@@ -187,8 +232,13 @@ export function FloatingCart({
                   </p>
                 )}
                 <div className="flex gap-4">
-                  <Button variant="outline" onClick={runDryRun} className="flex-1 h-14">
-                    SIMULATE
+                  <Button
+                    variant="outline"
+                    onClick={runDryRun}
+                    disabled={simulating}
+                    className="flex-1 h-14"
+                  >
+                    {simulating ? 'SIMULATING...' : 'SIMULATE'}
                   </Button>
                   <Button
                     onClick={execute}

@@ -5,6 +5,9 @@ export interface CleanupActionBase {
   objectIds: string[];
   /** sum of storage rebates (raw) for involved objects */
   storageRebateTotal: string;
+  /** per-object storage rebate; order matches objectIds. Needed to work out what a
+   * partially-included action actually realizes (merges keep their primary alive). */
+  objectStorageRebates?: string[];
   /** user rebate = storageRebateTotal * 0.99 (mist) */
   userRebateMist: number;
   /** estimated gas (mist) for this action */
@@ -33,6 +36,8 @@ export interface CloseKioskAction extends CleanupActionBase {
   kind: 'close_kiosk';
   kioskId: string;
   ownerCapId: string;
+  /** SUI (mist) the kiosk has accrued from sales; paid out to the owner on close */
+  profitsMist?: number;
   label: string;
 }
 

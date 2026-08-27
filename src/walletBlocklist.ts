@@ -1,3 +1,5 @@
+import { normalizeTypeAddress } from './constants';
+
 // mysten labs wallet blocklist for coins; @see https://github.com/MystenLabs/wallet_blocklist/blob/main/blocklists/coin-list.json
 const COIN_BLOCKLIST_URL =
   'https://raw.githubusercontent.com/MystenLabs/wallet_blocklist/main/blocklists/coin-list.json';
@@ -18,11 +20,22 @@ export type ObjectListResponse = {
   allowlist?: string[];
 };
 
+// The blocklist is the main thing standing between a scam object and a burn
+// suggestion, so a failed fetch must abort the scan rather than quietly return an
+// empty set — an empty set reads as "nothing is blocked" and removes the guard.
+const BLOCKLIST_ERROR =
+  'Could not load the Mysten wallet blocklist. Scanning is disabled without it, so nothing unsafe gets suggested. Try again shortly.';
+
 // fetch coin blocklist once and cache; returns set of blocked coin type args (e.g. "0x...::module::TYPE")
 export async function getWalletCoinBlocklist(): Promise<Set<string>> {
   if (cachedCoinBlocklist) return cachedCoinBlocklist;
-  const res = await fetch(COIN_BLOCKLIST_URL);
-  if (!res.ok) return new Set();
+  let res: Response;
+  try {
+    res = await fetch(COIN_BLOCKLIST_URL);
+  } catch {
+    throw new Error(BLOCKLIST_ERROR);
+  }
+  if (!res.ok) throw new Error(BLOCKLIST_ERROR);
   const json = (await res.json()) as CoinListResponse;
   const list = json.blocklist ?? [];
   cachedCoinBlocklist = new Set(list);
@@ -32,12 +45,23 @@ export async function getWalletCoinBlocklist(): Promise<Set<string>> {
 // fetch object blocklist once and cache; returns set of blocked Move type strings (e.g. "0x...::module::Type")
 export async function getWalletObjectBlocklist(): Promise<Set<string>> {
   if (cachedObjectBlocklist) return cachedObjectBlocklist;
-  const res = await fetch(OBJECT_BLOCKLIST_URL);
-  if (!res.ok) return new Set();
+  let res: Response;
+  try {
+    res = await fetch(OBJECT_BLOCKLIST_URL);
+  } catch {
+    throw new Error(BLOCKLIST_ERROR);
+  }
+  if (!res.ok) throw new Error(BLOCKLIST_ERROR);
   const json = (await res.json()) as ObjectListResponse;
   const list = json.blocklist ?? [];
-  cachedObjectBlocklist = new Set(list);
+  // normalize so a short-form lookup key still matches the canonical padded entries
+  cachedObjectBlocklist = new Set(list.map(normalizeTypeAddress));
   return cachedObjectBlocklist;
+}
+
+// true if this object type is on the blocklist, comparing on a normalized address
+export function isObjectTypeBlockedIn(blocklist: Set<string>, objectType: string): boolean {
+  return blocklist.has(normalizeTypeAddress(objectType));
 }
 
 // extract type arg from coin type (e.g. "0x2::coin::Coin<0x...::wal::WAL>" -> "0x...::wal::WAL")
@@ -58,5 +82,5 @@ export async function isCoinTypeBlocked(coinType: string): Promise<boolean> {
 // true if this object type is on the blocklist (exclude from burn / close kiosk)
 export async function isObjectTypeBlocked(objectType: string): Promise<boolean> {
   const blocklist = await getWalletObjectBlocklist();
-  return blocklist.has(objectType);
+  return isObjectTypeBlockedIn(blocklist, objectType);
 }

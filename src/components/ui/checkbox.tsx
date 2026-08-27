@@ -1,5 +1,5 @@
 import * as React from "react"
-import { cn } from "./utils"
+import { cn } from "../../utils/cn"
 
 export interface CheckboxProps extends React.InputHTMLAttributes<HTMLInputElement> {
   label?: React.ReactNode;
@@ -8,7 +8,8 @@ export interface CheckboxProps extends React.InputHTMLAttributes<HTMLInputElemen
 
 const Checkbox = React.forwardRef<HTMLInputElement, CheckboxProps>(
   ({ className, label, description, id, ...props }, ref) => {
-    const checkboxId = id || props.name || React.useId();
+    const generatedId = React.useId();
+    const checkboxId = id || props.name || generatedId;
     
     return (
       <div className="flex items-start gap-2">

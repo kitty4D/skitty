@@ -5,8 +5,8 @@ react app that lets you connect your wallet (or paste any sui address) and scan 
 ## what it does
 
 - **merge coins** - finds multiple `0x2::coin::Coin<T>` per type and merges them so you get the rebate.
-- **empty kiosks** - finds empty `0x2::kiosk::Kiosk` and closes them via your `KioskOwnerCap` (only if you own the cap and the kiosk has no dynamic fields).
-- **burnable stuff** - supports known burn/delete entry points (add more in `src/constants.ts`) and tries to discover burn functions via RPC for other types.
+- **empty kiosks** - finds empty `0x2::kiosk::Kiosk` and closes them via your `KioskOwnerCap` (only if you own the cap and the kiosk holds no items). any profits sitting in the kiosk are paid out to you.
+- **burnable stuff** - supports known burn/delete entry points (add more in `src/constants.ts`) and tries to discover burn functions via RPC for other types. discovered burns are matched by function name alone, so they're flagged unverified in the UI and need an explicit confirmation — skitty cannot tell a spam token from a valuable NFT.
 - **analysis** - lists every cleanup action with object count, IDs, and estimated user rebate.
 - **dry run** - simulates the tx before you sign so you see net SUI gain vs gas.
 - **feed skitty** - when viewing the raw simulation, you can have skitty (powered by Gemini) explain the txn in plain language. rate limited per minute and per day so the cat doesn’t get exhausted.
@@ -51,38 +51,68 @@ there’s a `vercel.json` in the repo (build output, rewrites if needed). with `
 
 **env for the API**
 
-create a `.env.local` (or set env in Vercel dashboard for prod). the explain API needs:
+create a `.env.local` (or set env in Vercel dashboard for prod). the API needs:
 
 - `GEMINI_API_KEY` - for the explain endpoint (Gemini).
-- `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` - for rate limiting (per minute / per day). if you skip these, the API will complain when it tries to rate limit.
+- `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` - rate limiting for both endpoints, plus gas-coin reservation for the sponsor. without them the sponsor falls back to picking a random coin from its pool and neither endpoint is rate limited, so set them for anything public.
+- `SUI_SPONSOR_PRIV` - **hot private key** (`suiprivkey...` or base64) for the wallet that pays gas. use a dedicated wallet holding only what you're willing to front, and keep its address equal to `FEE_RECIPIENT` in `src/constants.ts` — the sponsor only signs transactions where value goes to the sender or to itself, so a mismatch makes every sponsored transaction fail. without it `/api/sponsor` returns 503.
+- `ALLOWED_ORIGINS` (optional) - comma-separated extra origins allowed to call the API. same-origin and localhost are always allowed.
 
-## build
+## build and test
 
 ```bash
 npm run build
 npm run preview
 ```
 
+```bash
+npm test
+npm run lint
+```
+
 ## project layout
 
 - `src/ReclaimDashboard.tsx` - main UI: address input, SuiNS resolve, scan, action list, dry run, execute, feed skitty.
 - `src/useGraphQLScanner.ts` - hook that uses GraphQL + RPC to find mergeable coins, empty kiosks, and burnable objects.
-- `src/graphql/client.ts` - GraphQL client + SuiNS resolution via GraphQL.
-- `src/rpcClient.ts` - shared RPC client for SuiNS and burn discovery.
-- `src/buildCleanupTransaction.ts` - builds the `Transaction` for merge, destroy_zero, kiosk close, burn; fee split to skitty recipient.
-- `src/constants.ts` - MIST_PER_SUI, rebate multiplier, batch sizes, known burnable types, fee rate, explain rate limits.
+- `src/graphql/client.ts` - the single Sui client the whole app shares, plus SuiNS resolution (see the JSON-RPC note below).
+- `src/buildCleanupTransaction.ts` - builds the `Transaction` for merge, destroy_zero, kiosk close, burn; works out what the batch really reclaims and splits the fee.
+- `src/sponsoredTx.ts` - the shared simulate and execute pipeline (build → sponsor → simulate → sign → submit).
+- `src/actionIdentity.ts` - stable per-action keys so selections survive a re-scan without re-pointing at different objects.
+- `src/constants.ts` - MIST_PER_SUI, rebate multiplier, batch sizes, protected types, fee rate, explain rate limits.
 - `src/types.ts` - cleanup action and scanner state types.
 - `src/utils/format.ts` - formatSui, bytesToBase64, shortenAddress, shortLabelFromType, etc.
 - `src/utils/explain.ts` - explain rate-limit helpers (timestamps, canRequestExplain, recordExplainRequest).
 - `src/utils/suiNS.ts` - SuiNS domain resolution (SDK + GraphQL fallback).
-- `src/utils/network.ts` - RPC and GraphQL endpoint URLs by network.
-- `src/walletBlocklist.ts` - Mysten wallet blocklist for coins (exclude from merge/destroy).
+- `src/walletBlocklist.ts` - Mysten wallet blocklist (excludes blocked coins from merge/destroy and blocked objects from burn). fails closed: if it can't load, the scan stops.
 - `src/components/ScanProgressPanel.tsx` - scan progress card (phase, progress bar).
 - `src/components/WarningsBlock.tsx` - irreversible destruction warning alert.
 - `src/components/ActionCard.tsx` - single cleanup action row (checkbox, label, links, simulate/execute).
-- `src/components/FloatingCart.tsx` - queue panel with dry run summary and execute.
+- `src/components/FloatingCart.tsx` - queue panel with the fee/gas breakdown, dry run summary, and execute.
+- `api/sponsor.js` - serverless handler that co-signs reclaim transactions with the sponsor keypair.
+- `api/sponsorPolicy.js` - the allow-list deciding which transactions the sponsor is willing to sign.
 - `api/explain.js` - serverless handler: rate limit (RPM/RPD) then Gemini explain for the transaction payload.
-- `api/constants.js` - explain rate limit constants (used by explain.js).
+- `api/constants.js` - rate limit and sponsor constants (used by the API handlers).
+
+## how gas sponsorship stays safe
+
+The sponsor signature covers the whole transaction, gas coin included, so `/api/sponsor` never signs blind. A request has to clear four gates:
+
+1. **Rate limit and origin check.** Per-IP limits, and only signing counts against them — the simulate-only path issues no signature.
+2. **`validateReclaimTransactionKind`.** Commands must look like a reclaim batch: `destroy_zero`, `close_and_withdraw`, single-argument third-party burns, coin merges, and a fee split. The gas coin may only ever appear as the source of a `SplitCoins`, anything transferred must go to the sender or to the sponsor itself, and the sponsor may never be the sender (that would collapse the required signers to one and make our signature a complete transaction by itself).
+3. **A hard ceiling** (`MAX_GAS_COIN_SPLIT_MIST`) on the total that may be split out of the gas coin, summed across commands — so a wrong prediction in gate 4 can never authorize an unbounded transfer.
+4. **Simulation.** The transaction is simulated and rejected unless the sponsor's own SUI balance change is non-negative. This is the gate that bounds ordinary exposure, and it also catches any accounting bug that would otherwise pay out more rebate than the transaction reclaims.
+
+Gate 4 only holds if the simulated outcome is the executed outcome, which is why object arguments must be **owned and version-pinned**: a caller-controlled *shared* object could be mutated between our simulation and their submission, turning a profitable prediction into a real loss. The one exception is the Kiosk passed to `0x2::kiosk::close_and_withdraw`, a fixed framework function whose behaviour we know.
+
+For the same reason each signature reserves its gas coin **by version**, not by coin id: a signature stays valid until the coin actually moves, which is longer than any wall-clock lease, and two live signatures over one coin version can be equivocated to freeze it until end of epoch. Signed transactions also carry an **epoch expiration**, so a signature cannot be held indefinitely while the caller arranges for execution to diverge from the simulation it was based on.
+
+**Known residual risk.** None of these gates can tell "will succeed" from "will abort", and an aborted transaction still bills the sponsor for computation. A caller who deliberately makes a signed transaction abort costs the sponsor gas without gaining anything. That is bounded rather than eliminated: the signed gas budget is tightened to the simulated cost plus a margin (rather than the generous ceiling), per-IP rate limits cap the frequency, and each caller may hold at most `SPONSOR_MAX_HELD_COINS_PER_CALLER` gas coins reserved at a time. Related: a third-party burn function runs arbitrary code under the sponsor's gas and can branch on `TxContext`, which version-pinned inputs do not cover — the epoch expiration is what keeps that window short.
+
+`tests/sponsorPolicy.test.mjs` covers the drain shapes directly.
+
+## a note on Sui JSON-RPC
+
+Sui's public fullnodes have **removed JSON-RPC** — every method now returns *"Method not found. JSON-RPC on public fullnodes has been deprecated."* Everything here runs on the GraphQL client (`@mysten/sui/graphql`), including object reads, owned-object paging, Move-function lookups, execution and `waitForTransaction`. `src/rpcClient.ts` is only a re-export of that one client, and dapp-kit's `SuiClientProvider` is handed the same instance via `createClient` so it does not build a JSON-RPC client from a URL.
 
 ## disclaimer
 
