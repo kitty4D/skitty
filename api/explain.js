@@ -1,30 +1,29 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Ratelimit } from '@upstash/ratelimit';
-import { Redis } from '@upstash/redis';
+import { redis } from './redisClient.js';
 import {
   EXPLAIN_REQUESTS_PER_MINUTE,
   EXPLAIN_REQUESTS_PER_DAY,
   EXPLAIN_MAX_JSON_LENGTH,
 } from './constants.js';
 
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+const rpmLimit = redis
+  ? new Ratelimit({
+      redis,
+      limiter: Ratelimit.slidingWindow(EXPLAIN_REQUESTS_PER_MINUTE, '1 m'),
+      prefix: 'ratelimit_rpm',
+      analytics: true,
+    })
+  : null;
 
-const rpmLimit = new Ratelimit({
-  redis,
-  limiter: Ratelimit.slidingWindow(EXPLAIN_REQUESTS_PER_MINUTE, '1 m'),
-  prefix: 'ratelimit_rpm',
-  analytics: true,
-});
-
-const rpdLimit = new Ratelimit({
-  redis,
-  limiter: Ratelimit.fixedWindow(EXPLAIN_REQUESTS_PER_DAY, '1440 m'),
-  prefix: 'ratelimit_rpd',
-  analytics: true,
-});
+const rpdLimit = redis
+  ? new Ratelimit({
+      redis,
+      limiter: Ratelimit.fixedWindow(EXPLAIN_REQUESTS_PER_DAY, '1440 m'),
+      prefix: 'ratelimit_rpd',
+      analytics: true,
+    })
+  : null;
 
 const SYSTEM_INSTRUCTION = `You are Skitty, a diligent worker cat in the Sui ecosystem. Your job is to look at raw Sui Transaction JSON and explain what happened in simple, friendly layman's terms where possible, but always provide all of the details even if they can't all be given in simple terms.  The user wants to know if what the transaction request or response shows is harmful for them, what the transaction is attempting to do, and what the outcome actually is.
 
@@ -53,12 +52,21 @@ export default async function handler(req, res) {
     // actor burn the whole daily quota and take the feature offline for everybody.
     const identifier = clientIp(req);
 
-    // check the limit by minute
-    let result = await rpmLimit.limit(identifier);
-
-    // if limit by minute was ok, check limit by day
-    if (result.success) {
-      result = await rpdLimit.limit(identifier);
+    // Unlike sponsorship, this endpoint fails CLOSED without a working limiter: every
+    // call costs real Gemini spend, so running unthrottled is worse than being briefly
+    // unavailable. The sponsor path degrades instead, because its fund-safety gates do
+    // not depend on Redis.
+    let result;
+    try {
+      if (!rpmLimit || !rpdLimit) throw new Error('no rate limit store configured');
+      result = await rpmLimit.limit(identifier);
+      if (result.success) result = await rpdLimit.limit(identifier);
+    } catch (rateLimitError) {
+      console.error('[api/explain] rate limiter unavailable, refusing', rateLimitError);
+      res.setHeader('Retry-After', '60');
+      return res.status(503).json({
+        error: 'Skitty cannot check her limits right now, so she is napping. Try again shortly. 🐾',
+      });
     }
 
     // destructure that final result (fail RPM, fail RPD, or good RPD)

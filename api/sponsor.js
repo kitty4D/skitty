@@ -16,7 +16,7 @@ import { Transaction } from '@mysten/sui/transactions';
 import { SuiGraphQLClient } from '@mysten/sui/graphql';
 import { isValidSuiAddress } from '@mysten/sui/utils';
 import { Ratelimit } from '@upstash/ratelimit';
-import { Redis } from '@upstash/redis';
+import { redis } from './redisClient.js';
 import {
   SPONSOR_REQUESTS_PER_MINUTE,
   SPONSOR_REQUESTS_PER_DAY,
@@ -39,14 +39,6 @@ const SUI_COIN_TYPE = '0x2::sui::SUI';
 
 // max base64 payload we will even attempt to decode (~1MB of transaction kind)
 const MAX_TX_BYTES_BASE64 = 1_400_000;
-
-const redis =
-  process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
-    ? new Redis({
-        url: process.env.UPSTASH_REDIS_REST_URL,
-        token: process.env.UPSTASH_REDIS_REST_TOKEN,
-      })
-    : null;
 
 const rpmLimit = redis
   ? new Ratelimit({
@@ -175,6 +167,17 @@ async function reserveCoin(usable, identifier) {
   }
   // A signature is held until the coin moves, so one caller collecting signatures it
   // never submits could otherwise pin the whole pool and lock everyone else out.
+  try {
+    return await reserveCoinLocked(usable, identifier);
+  } catch (lockError) {
+    // Losing the lock store risks a duplicate signature over one coin version (which can
+    // freeze that coin), but it cannot cost the sponsor funds — so degrade rather than fail.
+    console.error('[api/sponsor] coin lock store unavailable, selecting without a lock', lockError);
+    return usable[Math.floor(Math.random() * usable.length)];
+  }
+}
+
+async function reserveCoinLocked(usable, identifier) {
   const holdsKey = `sponsor_holds:${identifier}`;
   // Create the key WITH its expiry first, then increment. Doing incr-then-expire leaves
   // a window where the expire never lands, and because the success path deliberately
@@ -246,10 +249,19 @@ export default async function handler(req, res) {
     const identifier = clientIp(req);
 
     // Only signing costs us anything, so simulate-only calls skip the quota.
+    // A rate limiter is a throttle, not a fund-safety gate — the policy and simulation
+    // gates are — so an unreachable or misconfigured Redis degrades to "unthrottled and
+    // loudly logged" rather than taking sponsorship down with an opaque 500.
     if (!isSimulateOnly && rpmLimit && rpdLimit) {
-      let result = await rpmLimit.limit(identifier);
-      if (result.success) result = await rpdLimit.limit(identifier);
-      if (!result.success) {
+      let result = null;
+      try {
+        result = await rpmLimit.limit(identifier);
+        if (result.success) result = await rpdLimit.limit(identifier);
+      } catch (rateLimitError) {
+        console.error('[api/sponsor] rate limiter unavailable, allowing request', rateLimitError);
+        result = null;
+      }
+      if (result && !result.success) {
         const retryAfter = Math.max(0, Math.floor((result.reset - Date.now()) / 1000));
         res.setHeader('Retry-After', String(retryAfter));
         return res.status(429).json({
