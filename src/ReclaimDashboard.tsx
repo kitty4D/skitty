@@ -6,8 +6,17 @@ import {
 } from '@mysten/dapp-kit';
 import { useGraphQLScanner } from './useGraphQLScanner';
 import { buildBatchTransaction, computeFeeMist } from './buildCleanupTransaction';
-import { simulateActions, executeActions } from './sponsoredTx';
+import {
+  simulateActions,
+  executeActions,
+  selfPaidGasSource,
+  SponsorUnavailableError,
+  type GasMode,
+} from './sponsoredTx';
+import { useSponsorStatus } from './useSponsorStatus';
+import { useSuiHoldings } from './useSuiHoldings';
 import { actionKey, actionDomId } from './actionIdentity';
+import { SELF_PAY_MIN_GAS_BUDGET_MIST } from './constants';
 import type { CleanupAction } from './types';
 
 // ui components
@@ -24,6 +33,7 @@ import { ScanProgressPanel } from './components/ScanProgressPanel';
 import { WarningsBlock } from './components/WarningsBlock';
 import { ActionCard } from './components/ActionCard';
 import { FloatingCart } from './components/FloatingCart';
+import { SponsorStatusBanner } from './components/SponsorStatusBanner';
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -69,8 +79,7 @@ export function ReclaimDashboard() {
     if (!rawInput || !isSuiNSDomain(rawInput)) {
       setResolvedAddress(null);
       setSuiNSError(null);
-      // the input is no longer the name that was submitted, so drop the queued scan —
-      // otherwise it fires against whatever the user types next
+      // the input is no longer the name that was submitted, so drop the queued scan - // otherwise it fires against whatever the user types next
       scanAfterResolveRef.current = false;
       return;
     }
@@ -114,6 +123,38 @@ export function ReclaimDashboard() {
 
   const { state, scan, refreshAfterExecute } = useGraphQLScanner(addressToUse);
 
+  const sponsor = useSponsorStatus();
+  const { markUnavailable: markSponsorUnavailable, refresh: refreshSponsor } = sponsor;
+  // optimistic while the first check is in flight; a refusal from the sponsor flips it
+  const gasMode: GasMode =
+    sponsor.availability === 'funded' || sponsor.availability === 'checking' ? 'sponsored' : 'self';
+  const { holdings: walletSui, refresh: refreshWalletSui } = useSuiHoldings(account?.address);
+  const walletGas = walletSui ? selfPaidGasSource(walletSui) : null;
+  const walletGasSource = walletGas?.source ?? null;
+  const walletGasAvailableMist = walletGas?.availableMist ?? null;
+  const walletHasNoGas =
+    walletGasAvailableMist != null && walletGasAvailableMist < SELF_PAY_MIN_GAS_BUDGET_MIST;
+  const noGasReason =
+    gasMode === 'self' && walletHasNoGas
+      ? `No SUI in this wallet for gas. It can't run anything until ${
+          sponsor.availability === 'unfunded' ? 'the sponsor is topped up' : 'sponsorship is back'
+        }.`
+      : null;
+
+  // the sponsor refused because it can't pay. flip to self-paid now instead of waiting on
+  // the next poll, and say so: the next attempt costs the user their own gas.
+  const sponsorRefusalMessage = React.useCallback(
+    (error: unknown): string | null => {
+      if (!(error instanceof SponsorUnavailableError)) return null;
+      if (error.code !== 'sponsor_unfunded' && error.code !== 'sponsor_not_configured') return null;
+      markSponsorUnavailable(error.code, error.sponsorAddress);
+      return error.code === 'sponsor_unfunded'
+        ? 'The gas sponsor just ran out of SUI, so your wallet pays gas from here on. Run it again to continue.'
+        : 'Gas sponsorship is offline, so your wallet pays gas from here on. Run it again to continue.';
+    },
+    [markSponsorUnavailable]
+  );
+
   // when user hit submit with SuiNS before resolve finished, run scan once address is ready
   React.useEffect(() => {
     if (scanAfterResolveRef.current && addressToUse && !state.loading) {
@@ -137,6 +178,8 @@ export function ReclaimDashboard() {
     netGainMist: number;
     gasCostMist: number;
     error?: string;
+    /** who paid gas in this simulation; its numbers are wrong for the other mode */
+    gasMode?: GasMode;
   } | null>(null);
   const [simulationModal, setSimulationModal] = React.useState<{
     /** net gain from formula (rebate - gas - fee); used when balance changes unavailable */
@@ -184,23 +227,53 @@ export function ReclaimDashboard() {
     if (selectedActionList.length === 0 || !senderAddress) return null;
     try {
       // no gas figure: the build charges only for the actions that fit under the cap
+      if (gasMode === 'sponsored') {
+        return buildBatchTransaction(selectedActionList, { sponsoredGas: true, senderAddress });
+      }
       return buildBatchTransaction(selectedActionList, {
-        sponsoredGas: true,
+        sponsoredGas: false,
         senderAddress,
+        // holdings not read yet: quote the full fee rather than understate it
+        selfPaidFee: {
+          source: walletGasSource ?? 'addressBalance',
+          maxMist:
+            walletGasAvailableMist != null
+              ? walletGasAvailableMist - SELF_PAY_MIN_GAS_BUDGET_MIST
+              : Number.MAX_SAFE_INTEGER,
+        },
       });
     } catch {
       return null;
     }
-  }, [selectedActionList, account?.address, state.scannedAddress]);
+  }, [
+    selectedActionList,
+    account?.address,
+    state.scannedAddress,
+    gasMode,
+    walletGasSource,
+    walletGasAvailableMist,
+  ]);
 
   const totalSelectedRebateMist = batchPreview?.userRebateMist ?? 0;
   const totalStorageRebateMist = batchPreview?.storageRebateMist ?? 0;
   const totalEstimatedGasMist = batchPreview?.gasMist ?? 0;
   const burnedMist = totalStorageRebateMist - totalSelectedRebateMist;
   const feeMist = batchPreview?.feeMist ?? 0;
-  const userShareMist = batchPreview?.userShareMist ?? 0;
+  // sponsored, the user's share is an explicit transfer; self-paid, the rebate lands in
+  // their own gas payment, so it's simply what's left after gas and fee (maybe negative)
+  const userShareMist =
+    gasMode === 'sponsored'
+      ? batchPreview?.userShareMist ?? 0
+      : batchPreview
+        ? batchPreview.userRebateMist - batchPreview.gasMist - batchPreview.feeMist
+        : 0;
   const droppedActionCount = batchPreview?.droppedActionCount ?? 0;
-  const canSponsorBatch = batchPreview != null && batchPreview.userShareMist >= 0;
+  const cartBlockedReason =
+    gasMode === 'sponsored'
+      ? batchPreview == null
+        ? "Rebate doesn't cover gas + fee, so the sponsor won't pay for this."
+        : null
+      : noGasReason;
 
   // One simulate path and one execute path, both taking the actions to act on. These
   // were four near-identical copies; the transaction plumbing now lives in sponsoredTx.
@@ -221,7 +294,7 @@ export function ReclaimDashboard() {
       setGeminiExplanation(null);
       setGeminiError(null);
       try {
-        const outcome = await simulateActions(actions, senderAddress);
+        const outcome = await simulateActions(actions, senderAddress, gasMode);
         // a newer simulation (or a selection change) supersedes this result
         if (simulationEpochRef.current !== epoch) return;
         setLastDryRunRawJson(outcome.rawJson);
@@ -232,6 +305,7 @@ export function ReclaimDashboard() {
           netGainMist: outcome.netGainMist,
           gasCostMist: outcome.gasCostMist,
           error,
+          gasMode: outcome.gasMode,
         });
         const expectedInflowMist =
           outcome.netInflowMist ??
@@ -250,7 +324,7 @@ export function ReclaimDashboard() {
         }
       } catch (e) {
         if (simulationEpochRef.current !== epoch) return;
-        const errMsg = e instanceof Error ? e.message : String(e);
+        const errMsg = sponsorRefusalMessage(e) ?? (e instanceof Error ? e.message : String(e));
         setLastDryRunRawJson(JSON.stringify({ request: null, response: { error: errMsg } }, null, 2));
         setDryRunResult({ netGainMist: 0, gasCostMist: 0, error: errMsg });
         if (forKey) setSimulationModal({ error: errMsg });
@@ -258,7 +332,7 @@ export function ReclaimDashboard() {
         if (simulationEpochRef.current === epoch) setSimulating(false);
       }
     },
-    [account?.address, state.scannedAddress]
+    [account?.address, state.scannedAddress, gasMode, sponsorRefusalMessage]
   );
 
   const performExecute = React.useCallback(
@@ -273,7 +347,7 @@ export function ReclaimDashboard() {
       setExecuteNotice(null);
       setLastSponsorImpact(null);
       try {
-        const outcome = await executeActions(actions, account.address, signTransaction);
+        const outcome = await executeActions(actions, account.address, signTransaction, gasMode);
         setDryRunResult(null);
         // drop only what was executed, so running one card does not empty the whole queue
         const executedKeys = new Set(outcome.executedActions.map(actionKey));
@@ -291,16 +365,27 @@ export function ReclaimDashboard() {
             'Submitted, but finality is taking a while. Check the explorer if your balance has not updated.'
           );
         }
+        // both balances just moved: the user's gas, and the sponsor's pool
+        refreshWalletSui();
+        refreshSponsor();
         await refreshAfterExecute(outcome.executedActions);
       } catch (e) {
-        setExecuteError(e instanceof Error ? e.message : String(e));
+        setExecuteError(sponsorRefusalMessage(e) ?? (e instanceof Error ? e.message : String(e)));
       } finally {
         // no safety timer: this always runs, and a timer that fires mid-signing would
         // re-enable Execute and let a second transaction race the first over the same objects
         setExecuting(false);
       }
     },
-    [account?.address, signTransaction, refreshAfterExecute]
+    [
+      account?.address,
+      signTransaction,
+      refreshAfterExecute,
+      gasMode,
+      sponsorRefusalMessage,
+      refreshWalletSui,
+      refreshSponsor,
+    ]
   );
 
   // burns and kiosk closes are irreversible, so they get an explicit confirmation
@@ -316,10 +401,11 @@ export function ReclaimDashboard() {
     [performExecute, executing]
   );
 
-  // clear simulated yields when scan results change so we don't show stale numbers
+  // clear simulated yields when scan results change so we don't show stale numbers, and
+  // when who pays gas changes, since every one of them was priced for the other payer
   React.useEffect(() => {
     setSimulatedNetInflowByKey({});
-  }, [state.scannedAddress, state.actions]);
+  }, [state.scannedAddress, state.actions, gasMode]);
 
   // a simulation belongs to the selection it was run for; changing the queue invalidates
   // it, and bumping the epoch stops an in-flight one from landing afterwards
@@ -488,6 +574,18 @@ export function ReclaimDashboard() {
       </AnimatePresence>
 
       <main className="mx-auto max-w-5xl px-6 py-12 space-y-12 pb-48">
+        <AnimatePresence>
+          {gasMode === 'self' && (
+            <SponsorStatusBanner
+              key="sponsor-status"
+              availability={sponsor.availability}
+              reason={sponsor.reason}
+              sponsorAddress={sponsor.sponsorAddress}
+              walletHasNoGas={Boolean(account?.address) && walletHasNoGas}
+            />
+          )}
+        </AnimatePresence>
+
         <motion.div
           initial={{ y: 20, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
@@ -679,9 +777,14 @@ export function ReclaimDashboard() {
                           onExecute={() => requestExecute([action])}
                           executing={executing}
                           simulating={simulating}
-                          canSponsor={
-                            action.userRebateMist >=
-                            action.estimatedGasMist + computeFeeMist(Number(action.storageRebateTotal))
+                          executeBlockedReason={
+                            gasMode === 'self'
+                              ? noGasReason
+                              : action.userRebateMist >=
+                                  action.estimatedGasMist +
+                                    computeFeeMist(Number(action.storageRebateTotal))
+                                ? null
+                                : "Rebate doesn't cover gas + fee"
                           }
                         />
                       ))}
@@ -727,7 +830,11 @@ export function ReclaimDashboard() {
               estimatedGasMist={totalEstimatedGasMist}
               userShareMist={userShareMist}
               droppedActionCount={droppedActionCount}
-              dryRunResult={dryRunResult}
+              dryRunResult={
+                dryRunResult && (dryRunResult.error || dryRunResult.gasMode === gasMode)
+                  ? dryRunResult
+                  : null
+              }
               executeError={executeError}
               executeNotice={executeNotice}
               runDryRun={() => runSimulation(selectedActionList)}
@@ -737,7 +844,8 @@ export function ReclaimDashboard() {
               executing={executing}
               simulating={simulating}
               accountConnected={!!account?.address}
-              canSponsor={canSponsorBatch}
+              gasMode={gasMode}
+              executeBlockedReason={cartBlockedReason}
               lastSponsorImpact={lastSponsorImpact}
               isMinimized={isCartMinimized}
               onToggleMinimize={() => setIsCartMinimized(!isCartMinimized)}
@@ -872,8 +980,7 @@ export function ReclaimDashboard() {
                   Permanently destroy {objectCount} object{objectCount === 1 ? '' : 's'}?
                 </h3>
                 <p className="text-sm text-skitty-secondary mb-4 leading-relaxed">
-                  This cannot be undone. These objects are gone for good once the transaction lands —
-                  including any in-game progress, airdrop eligibility, or collectible value they carry.
+                  This cannot be undone. These objects are gone for good once the transaction lands - including any in-game progress, airdrop eligibility, or collectible value they carry.
                 </p>
                 <ul className="action-panel-scroll max-h-[180px] overflow-y-auto mb-4 space-y-1 border-2 border-white/10 p-3">
                   {destructive.map((a) => (
@@ -894,7 +1001,7 @@ export function ReclaimDashboard() {
                 {hasDiscovered && (
                   <p className="text-[10px] font-black uppercase tracking-widest text-amber-400 mb-3 leading-relaxed">
                     Some of these burn functions were auto-discovered by name, not verified. Skitty
-                    cannot tell a spam token from a valuable NFT — check them yourself first.
+                    cannot tell a spam token from a valuable NFT - check them yourself first.
                   </p>
                 )}
                 {kioskProfitsMist > 0 && (

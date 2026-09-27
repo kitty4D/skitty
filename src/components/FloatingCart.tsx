@@ -4,6 +4,7 @@ import { Button } from './ui/button';
 import { computeFeeMist } from '../buildCleanupTransaction';
 import { formatSui, shortLabelFromType } from '../utils/format';
 import { actionKey } from '../actionIdentity';
+import type { GasMode } from '../sponsoredTx';
 import type { CleanupAction } from '../types';
 
 export function FloatingCart({
@@ -24,7 +25,8 @@ export function FloatingCart({
   executing,
   simulating = false,
   accountConnected,
-  canSponsor = true,
+  gasMode = 'sponsored',
+  executeBlockedReason = null,
   lastSponsorImpact = null,
   isMinimized,
   onToggleMinimize,
@@ -36,7 +38,7 @@ export function FloatingCart({
   /** 13.69% service fee this transaction will actually charge */
   feeMist: number;
   estimatedGasMist: number;
-  /** SUI the user receives after fee and gas */
+  /** SUI the user ends up with after fee and gas; negative when the batch costs more than it returns */
   userShareMist: number;
   /** actions the batch cap left out of this transaction */
   droppedActionCount?: number;
@@ -50,8 +52,10 @@ export function FloatingCart({
   executing: boolean;
   simulating?: boolean;
   accountConnected: boolean;
-  /** false when rebate does not cover gas + fee; we do not sponsor */
-  canSponsor?: boolean;
+  /** 'self' while the sponsor can't pay, so the user's own wallet covers gas */
+  gasMode?: GasMode;
+  /** why execute is off (unsponsorable, or no SUI for self-paid gas); null when it can run */
+  executeBlockedReason?: string | null;
   /** sponsor's net SUI from last executed tx (for P&L visibility) */
   lastSponsorImpact?: { digest: string; netMist: number } | null;
   isMinimized: boolean;
@@ -121,8 +125,17 @@ export function FloatingCart({
               <div className="border-t-2 border-skitty-accent pt-4 space-y-2">
                 <div className="flex justify-between items-start gap-4">
                   <div>
-                    <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">YOU RECEIVE (EST.)</p>
-                    <p className="text-4xl font-black text-white tracking-tighter leading-none mt-1">{formatSui(userShareMist)} SUI</p>
+                    <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">
+                      {userShareMist < 0 ? 'NET COST (EST.)' : 'YOU RECEIVE (EST.)'}
+                    </p>
+                    <p className={`text-4xl font-black tracking-tighter leading-none mt-1 ${userShareMist < 0 ? 'text-red-400' : 'text-white'}`}>
+                      {formatSui(Math.abs(userShareMist))} SUI
+                    </p>
+                    {gasMode === 'self' && (
+                      <p className="text-[10px] font-black text-amber-400 uppercase tracking-widest leading-snug mt-2 max-w-[14rem]">
+                        Sponsor unavailable: your wallet pays gas
+                      </p>
+                    )}
                   </div>
                   <div className="text-right space-y-1 shrink-0">
                     <div>
@@ -138,7 +151,9 @@ export function FloatingCart({
                       <p className="text-xs font-black text-amber-400/80 tracking-tighter">-{formatSui(feeMist)} SUI</p>
                     </div>
                     <div>
-                      <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">Gas (est.)</p>
+                      <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">
+                        {gasMode === 'self' ? 'Gas, your wallet (est.)' : 'Gas (est.)'}
+                      </p>
                       <p className="text-xs font-black text-skitty-secondary/80 tracking-tighter">-{formatSui(estimatedGasMist)} SUI</p>
                     </div>
                   </div>
@@ -146,7 +161,7 @@ export function FloatingCart({
                 {droppedActionCount > 0 && (
                   <p className="text-[10px] font-black text-amber-400 uppercase tracking-widest leading-snug">
                     Some selected objects won&apos;t fit in one transaction and are not included
-                    above — run another purge afterwards to clear the rest.
+                    above. Run another purge afterwards to clear the rest.
                   </p>
                 )}
               </div>
@@ -226,9 +241,9 @@ export function FloatingCart({
                   <PartyPopper className="w-5 h-5 mr-2 shrink-0" />
                   Save the Objects!
                 </Button>
-                {!canSponsor && (
-                  <p className="text-[10px] font-black text-amber-500 uppercase tracking-widest">
-                    Rebate does not cover gas + fee — we do not sponsor this.
+                {executeBlockedReason && (
+                  <p className="text-[10px] font-black text-amber-500 uppercase tracking-widest leading-snug">
+                    {executeBlockedReason}
                   </p>
                 )}
                 <div className="flex gap-4">
@@ -242,9 +257,9 @@ export function FloatingCart({
                   </Button>
                   <Button
                     onClick={execute}
-                    disabled={executing || !accountConnected || !canSponsor}
+                    disabled={executing || !accountConnected || Boolean(executeBlockedReason)}
                     className="flex-1 h-14 bg-white text-black hover:bg-skitty-accent hover:text-white"
-                    title={!canSponsor ? 'Rebate does not cover gas + fee' : undefined}
+                    title={executeBlockedReason ?? undefined}
                   >
                     {executing ? 'PURGING...' : 'EXECUTE PURGE'}
                   </Button>

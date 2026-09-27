@@ -140,6 +140,95 @@ describe('buildBatchTransaction rebate accounting', () => {
   });
 });
 
+describe('buildBatchTransaction self-paid fee', () => {
+  const selfPaid = (
+    actions: CleanupAction[],
+    selfPaidFee: { source: 'gasCoin' | 'addressBalance'; maxMist: number } | null
+  ) =>
+    buildBatchTransaction(actions, {
+      sponsoredGas: false,
+      senderAddress: SENDER,
+      estimatedGasMist: 1000,
+      selfPaidFee,
+    });
+
+  // every argument in the PTB, including the ones nested inside commands
+  const usesGasCoin = (result: ReturnType<typeof selfPaid>) =>
+    JSON.stringify(result.tx.getData().commands).includes('"GasCoin"');
+  const moveCalls = (result: ReturnType<typeof selfPaid>) =>
+    result.tx
+      .getData()
+      .commands.flatMap((command) =>
+        command.MoveCall ? [`${command.MoveCall.module}::${command.MoveCall.function}`] : []
+      );
+  const transfers = (result: ReturnType<typeof selfPaid>) =>
+    result.tx.getData().commands.filter((command) => command.$kind === 'TransferObjects').length;
+
+  it('splits the fee from tx.gas when coins pay the gas', () => {
+    const result = selfPaid([destroyAction('0xa', 1_000_000)], { source: 'gasCoin', maxMist: 10_000_000 });
+    expect(result.feeMist).toBe(computeFeeMist(1_000_000));
+    expect(usesGasCoin(result)).toBe(true);
+    expect(moveCalls(result)).toContain('coin::send_funds');
+  });
+
+  it('withdraws the fee and never touches tx.gas when the address balance pays', () => {
+    // a GasCoin argument would force the resolver onto coin objects this wallet may not own
+    const result = selfPaid([destroyAction('0xa', 1_000_000)], {
+      source: 'addressBalance',
+      maxMist: 10_000_000,
+    });
+    expect(result.feeMist).toBe(computeFeeMist(1_000_000));
+    expect(usesGasCoin(result)).toBe(false);
+    expect(result.tx.getData().inputs.some((input) => input.$kind === 'FundsWithdrawal')).toBe(true);
+    expect(moveCalls(result)).toEqual(
+      expect.arrayContaining(['balance::redeem_funds', 'balance::send_funds'])
+    );
+  });
+
+  it('sends the fee to an address balance instead of minting a coin the user pays storage on', () => {
+    for (const source of ['gasCoin', 'addressBalance'] as const) {
+      const result = selfPaid([destroyAction('0xa', 1_000_000)], { source, maxMist: 10_000_000 });
+      expect(transfers(result)).toBe(0);
+    }
+  });
+
+  it('caps the fee at what the gas source can spare after the budget', () => {
+    const result = selfPaid([destroyAction('0xa', 1_000_000)], { source: 'gasCoin', maxMist: 5000 });
+    expect(result.feeMist).toBe(5000);
+  });
+
+  it('waives the fee when there is nothing to take it from', () => {
+    for (const fee of [null, { source: 'gasCoin' as const, maxMist: 0 }, { source: 'addressBalance' as const, maxMist: -1 }]) {
+      const result = selfPaid([destroyAction('0xa', 1_000_000)], fee);
+      expect(result.feeMist).toBe(0);
+      expect(usesGasCoin(result)).toBe(false);
+      expect(result.tx.getData().inputs.some((input) => input.$kind === 'FundsWithdrawal')).toBe(false);
+    }
+  });
+
+  it('waives the fee on a batch that does not cover its own gas', () => {
+    const result = buildBatchTransaction([destroyAction('0xa', 1000)], {
+      sponsoredGas: false,
+      senderAddress: SENDER,
+      estimatedGasMist: 5_000_000,
+      selfPaidFee: { source: 'gasCoin', maxMist: 10_000_000 },
+    });
+    expect(result.feeMist).toBe(0);
+  });
+
+  it('ignores a self-paid fee when the sponsor pays', () => {
+    // the sponsored path keeps the fee inside the sponsor's gas coin; a stray option
+    // must never add a withdrawal from the user on top
+    const result = buildBatchTransaction([destroyAction('0xa', 1_000_000)], {
+      sponsoredGas: true,
+      senderAddress: SENDER,
+      estimatedGasMist: 1000,
+      selfPaidFee: { source: 'addressBalance', maxMist: 10_000_000 },
+    });
+    expect(result.tx.getData().inputs.some((input) => input.$kind === 'FundsWithdrawal')).toBe(false);
+  });
+});
+
 describe('isProtectedType', () => {
   it('matches staked SUI at its real package (0x3, not 0x2)', () => {
     expect(isProtectedType('0x3::staking_pool::StakedSui')).toBe(true);

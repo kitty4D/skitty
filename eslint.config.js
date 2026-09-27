@@ -26,8 +26,8 @@ export default tseslint.config(
     },
   },
   {
-    // Vercel serverless functions and root build config: Node + ESM.
-    files: ['api/**/*.js', '*.config.js'],
+    // Vercel serverless functions, the code they share, and root build config: Node + ESM.
+    files: ['api/**/*.js', 'lib/**/*.js', '*.config.js'],
     extends: [js.configs.recommended],
     languageOptions: {
       ecmaVersion: 2022,

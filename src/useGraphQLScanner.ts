@@ -139,7 +139,7 @@ export function useGraphQLScanner(address: string | null) {
       for (const a of executedActions) {
         const remaining = a.objectIds.filter((id) => existingIds.has(id));
         // a merge keeps its primary coin alive by design, so "every id gone" never
-        // holds for it — an action is spent once it can no longer be performed
+        // holds for it - an action is spent once it can no longer be performed
         const spent = a.kind === 'merge_coins' ? remaining.length <= 1 : remaining.length === 0;
         if (spent) keysToRemove.add(actionKey(a));
       }
@@ -467,8 +467,7 @@ async function inspectKiosk(
     const itemCount = Number(fields.item_count ?? 0);
     if (!Number.isFinite(itemCount)) return null;
     // item_count only covers items. Kiosk extensions live as dynamic fields on the
-    // kiosk's UID and never touch it, and close_and_withdraw deletes the UID outright —
-    // orphaning that extension's storage. Require the kiosk to be empty both ways.
+    // kiosk's UID and never touch it, and close_and_withdraw deletes the UID outright - // orphaning that extension's storage. Require the kiosk to be empty both ways.
     const dynamicFieldCount = (data as KioskObject)?.address?.dynamicFields?.nodes?.length ?? 0;
     // profits is a Balance<SUI>, which serializes either as a bare u64 string or as { value }
     const profits = fields.profits;
@@ -542,7 +541,7 @@ function burnFunctionMatches(fn: MoveFunction, objectType: string): boolean {
   const params = (fn.parameters ?? []).filter((p) => !isTxContextParam(p));
   if (params.length !== 1) return false;
   // by-reference means the function borrows the object rather than consuming it, so it
-  // cannot be destroying anything — the call would succeed, the object would survive,
+  // cannot be destroying anything - the call would succeed, the object would survive,
   // and we would have charged a fee against a storage rebate that never materialized
   if (params[0].reference != null) return false;
   const only = datatypeNameOf(params[0]);
@@ -567,7 +566,7 @@ async function getMoveFunctionCached(
     return result;
   } catch {
     // The SDK throws the same way for "no such function" and for a network/rate-limit
-    // failure, so this is not cached — caching a transient failure would permanently
+    // failure, so this is not cached - caching a transient failure would permanently
     // mark a real burn entry point as nonexistent for the rest of the session.
     return null;
   }

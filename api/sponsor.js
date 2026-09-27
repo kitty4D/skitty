@@ -1,6 +1,12 @@
-// POST /api/sponsor – sponsor gas for reclaim transactions
+// POST /api/sponsor - sponsor gas for reclaim transactions
 // body: { txBytes: string (base64 transaction kind bytes), userAddress: string, simulateOnly?: boolean }
 // returns: { sponsoredTxBytes: string (base64), sponsorSignature?: string, sponsorAddress: string }
+// operational refusals are 503s carrying a `code`, so the client can tell "the sponsor
+// can't pay" (fall back to self-paid gas) from "the sponsor is busy" (retry):
+//   sponsor_unfunded | sponsor_not_configured | sponsor_insufficient | sponsor_busy
+//
+// GET /api/sponsor - can the sponsor pay gas at all right now?
+// returns: { funded: boolean, reason: string, sponsorAddress: string | null }
 //
 // The sponsor signature authorizes the ENTIRE TransactionData, including the
 // gas coin, so this endpoint must never blind-sign. Three gates stand between a
@@ -16,7 +22,7 @@ import { Transaction } from '@mysten/sui/transactions';
 import { SuiGraphQLClient } from '@mysten/sui/graphql';
 import { isValidSuiAddress } from '@mysten/sui/utils';
 import { Ratelimit } from '@upstash/ratelimit';
-import { redis } from './redisClient.js';
+import { redis } from '../lib/redisClient.js';
 import {
   SPONSOR_REQUESTS_PER_MINUTE,
   SPONSOR_REQUESTS_PER_DAY,
@@ -26,13 +32,25 @@ import {
   SPONSOR_COIN_POOL_SIZE,
   SPONSOR_COIN_LOCK_SECONDS,
   SPONSOR_MAX_HELD_COINS_PER_CALLER,
-} from './constants.js';
+  SPONSOR_MIN_CONVERSION_MIST,
+  SPONSOR_CONVERSION_GAS_BUDGET_MIST,
+  SPONSOR_CONVERSION_LOCK_SECONDS,
+  SPONSOR_CONVERSION_BACKOFF_SECONDS,
+} from '../lib/constants.js';
 import {
   validateReclaimTransactionKind,
   netSuiChangeForAddress,
   gasCoinNetMist,
   SponsorPolicyError,
-} from './sponsorPolicy.js';
+} from '../lib/sponsorPolicy.js';
+import {
+  coinsCovering,
+  conversionAmount,
+  conversionTransaction,
+  createdCoinRef,
+  fetchExpirationContext,
+  fundingReason,
+} from '../lib/sponsorGasCoin.js';
 
 const GRAPHQL_URL = 'https://graphql.mainnet.sui.io/graphql';
 const SUI_COIN_TYPE = '0x2::sui::SUI';
@@ -107,15 +125,11 @@ function originAllowed(req) {
 }
 
 /**
- * A sponsor's SUI sits in one of two places and gas can come from either, but they are
- * selected differently:
- *   - an ADDRESS BALANCE pays gas through an EMPTY gas payment plus an expiration.
- *     Automatic gas selection does NOT find it (it fails with "Gas object is not an
- *     owned object"), so it has to be requested explicitly.
- *   - Coin<SUI> OBJECTS are pooled and reserved, because two signatures over one coin
- *     version can be equivocated to freeze that coin until end of epoch.
- * A wallet funded by a recent transfer may hold everything as an address balance and own
- * no coins at all, so both have to be read to know what this sponsor can actually do.
+ * the sponsor's SUI sits in two places and only one of them is any use here. Coin<SUI>
+ * objects pay gas, and get pooled and reserved because two signatures over one coin
+ * version can be equivocated to freeze it until end of epoch. an address balance can't
+ * pay for this app at all (see the handler), but it can be converted into a coin, so
+ * both get read.
  */
 async function fetchSponsorGas(client, address) {
   const [coinPage, balance] = await Promise.all([
@@ -131,13 +145,136 @@ async function fetchSponsorGas(client, address) {
       digest: coin.digest,
       balanceMist: BigInt(coin.balance ?? 0),
     }))
-    .filter((coin) => coin.balanceMist >= BigInt(SPONSOR_GAS_BUDGET_MIST))
     .sort((a, b) => (b.balanceMist > a.balanceMist ? 1 : b.balanceMist < a.balanceMist ? -1 : 0));
   return {
     coins,
     addressBalanceMist: BigInt(balance?.balance?.addressBalance ?? 0),
     totalBalanceMist: BigInt(balance?.balance?.balance ?? 0),
   };
+}
+
+const FUNDING_DETAIL = {
+  empty: 'it is empty',
+  address_balance:
+    'its SUI sits in an address balance, which cannot pay gas for this app, and converting it into a coin has not worked yet',
+  too_little: `it holds less than the ${SPONSOR_MIN_CONVERSION_MIST + SPONSOR_CONVERSION_GAS_BUDGET_MIST} mist a usable gas coin needs`,
+};
+
+// ---- turning an address-balance top-up into a gas coin ----
+//
+// the sponsor address is on screen whenever it can't pay, so a top-up can come from
+// anyone, any time, and from a modern wallet it lands as an address balance. the server
+// holds the key, so it converts the balance itself instead of waiting for someone to
+// run scripts/materialize-gas-coin.mjs. it's safe to trigger from a public request: the
+// transaction only moves the sponsor's SUI from its balance into a coin it owns, it only
+// runs when no usable coin exists, and the lock caps it at one attempt per window.
+
+const CONVERSION_LOCK_KEY = 'sponsor_conversion';
+// per-instance fallback when there's no lock store. weaker (instances don't share it),
+// but a duplicate conversion fails its withdrawal check rather than losing anything.
+let localConversionBlockedUntil = 0;
+
+async function claimConversion(seconds, { overwrite = false } = {}) {
+  if (redis) {
+    try {
+      const result = await redis.set(CONVERSION_LOCK_KEY, String(Date.now()), {
+        ...(overwrite ? {} : { nx: true }),
+        ex: seconds,
+      });
+      return Boolean(result);
+    } catch (lockError) {
+      console.error('[api/sponsor] conversion lock unavailable, using a local one', lockError);
+    }
+  }
+  if (!overwrite && Date.now() < localConversionBlockedUntil) return false;
+  localConversionBlockedUntil = Date.now() + seconds * 1000;
+  return true;
+}
+
+/**
+ * convert the address balance into a gas coin if that would give the sponsor a coin
+ * covering `requiredSpendableMist`. returns the gas state to use from here on: fresh if
+ * it converted, the one passed in if it didn't. exported only so it can be driven
+ * against mainnet with a stand-in signer; the handler is the real caller.
+ */
+export async function convertAddressBalance(client, keypair, gas, requiredSpendableMist) {
+  const amountMist = conversionAmount(gas, requiredSpendableMist);
+  if (amountMist === null) return gas;
+  if (!(await claimConversion(SPONSOR_CONVERSION_LOCK_SECONDS))) return gas;
+
+  const address = keypair.getPublicKey().toSuiAddress();
+  try {
+    const tx = conversionTransaction({
+      address,
+      amountMist,
+      ...(await fetchExpirationContext(client)),
+    });
+    const bytes = await tx.build({ client });
+    // a failed simulation costs nothing; a failed execution bills the very balance this
+    // is trying to rescue
+    const simulation = await client.simulateTransaction({
+      transaction: bytes,
+      include: { effects: true },
+    });
+    if (simulation.$kind !== 'Transaction' || !simulation.Transaction?.status?.success) {
+      const simulated = simulation.Transaction ?? simulation.FailedTransaction;
+      throw new Error(`simulation failed: ${JSON.stringify(simulated?.status?.error ?? null)}`);
+    }
+    const { signature } = await keypair.signTransaction(bytes);
+    const executed = await client.executeTransaction({
+      transaction: bytes,
+      signatures: [signature],
+      include: { effects: true },
+    });
+    const done = executed.$kind === 'Transaction' ? executed.Transaction : executed.FailedTransaction;
+    if (executed.$kind !== 'Transaction' || !done?.status?.success) {
+      throw new Error(`execution failed: ${JSON.stringify(done?.status?.error ?? null)}`);
+    }
+    const coin = createdCoinRef(done.effects, address);
+    console.log(
+      `[api/sponsor] converted ${amountMist} mist of address balance into gas coin ${coin?.objectId ?? '(unknown)'} in ${done.digest}`
+    );
+    await client.waitForTransaction({ digest: done.digest, timeout: 20_000 }).catch(() => {});
+
+    const fresh = await fetchSponsorGas(client, address);
+    // the indexer can trail the effects; trust the effects for the coin we just made
+    if (coin && !fresh.coins.some((existing) => existing.objectId === coin.objectId)) {
+      fresh.coins.unshift({ ...coin, balanceMist: amountMist });
+    }
+    return fresh;
+  } catch (error) {
+    console.error('[api/sponsor] address balance conversion failed', error);
+    await claimConversion(SPONSOR_CONVERSION_BACKOFF_SECONDS, { overwrite: true });
+    return gas;
+  }
+}
+
+// the UI polls this to decide who pays gas, so it has to answer "no" without the key and
+// never say anything a chain explorer wouldn't. the CDN cache keeps the polling from
+// turning into a GraphQL load generator, and it's also what paces conversion attempts.
+async function sponsorStatus(res) {
+  let keypair;
+  try {
+    keypair = getHouseKeypair();
+  } catch {
+    res.setHeader('Cache-Control', 'public, s-maxage=60');
+    return res.status(200).json({ funded: false, reason: 'not_configured', sponsorAddress: null });
+  }
+  const sponsorAddress = keypair.getPublicKey().toSuiAddress();
+  try {
+    const client = new SuiGraphQLClient({ url: GRAPHQL_URL, network: 'mainnet' });
+    let gas = await fetchSponsorGas(client, sponsorAddress);
+    if (fundingReason(gas) === 'address_balance') {
+      gas = await convertAddressBalance(client, keypair, gas, 0n);
+    }
+    const reason = fundingReason(gas);
+    res.setHeader('Cache-Control', 'public, s-maxage=15, stale-while-revalidate=45');
+    return res.status(200).json({ funded: reason === 'ok', reason, sponsorAddress });
+  } catch (error) {
+    console.error('[api/sponsor] status check failed', error);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).json({ funded: false, reason: 'unreachable', sponsorAddress });
+  }
 }
 
 async function fetchCurrentEpoch(client) {
@@ -152,7 +289,7 @@ async function fetchCurrentEpoch(client) {
 
 // Two signatures over the same coin VERSION are an equivocation risk: submit both and
 // the coin is locked until end of epoch. The lock is therefore keyed on the version, not
-// just the coin — a signature stays valid until the coin actually moves, which is far
+// just the coin - a signature stays valid until the coin actually moves, which is far
 // longer than any wall-clock TTL we could pick (the user has to approve in their wallet).
 // Once the coin is spent its version changes, so the old key simply stops matching.
 function coinLockKey(coin) {
@@ -171,7 +308,7 @@ async function reserveCoin(usable, identifier) {
     return await reserveCoinLocked(usable, identifier);
   } catch (lockError) {
     // Losing the lock store risks a duplicate signature over one coin version (which can
-    // freeze that coin), but it cannot cost the sponsor funds — so degrade rather than fail.
+    // freeze that coin), but it cannot cost the sponsor funds - so degrade rather than fail.
     console.error('[api/sponsor] coin lock store unavailable, selecting without a lock', lockError);
     return usable[Math.floor(Math.random() * usable.length)];
   }
@@ -216,8 +353,9 @@ async function releaseCoin(coin) {
 }
 
 export default async function handler(req, res) {
+  if (req.method === 'GET') return sponsorStatus(res);
   if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST');
+    res.setHeader('Allow', 'GET, POST');
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
@@ -243,14 +381,15 @@ export default async function handler(req, res) {
       return res.status(503).json({
         error:
           'Sponsor not configured. Add SUI_SPONSOR_PRIV to your deployment environment (e.g. Vercel project env vars).',
+        code: 'sponsor_not_configured',
       });
     }
 
     const identifier = clientIp(req);
 
     // Only signing costs us anything, so simulate-only calls skip the quota.
-    // A rate limiter is a throttle, not a fund-safety gate — the policy and simulation
-    // gates are — so an unreachable or misconfigured Redis degrades to "unthrottled and
+    // A rate limiter is a throttle, not a fund-safety gate - the policy and simulation
+    // gates are - so an unreachable or misconfigured Redis degrades to "unthrottled and
     // loudly logged" rather than taking sponsorship down with an opaque 500.
     if (!isSimulateOnly && rpmLimit && rpdLimit) {
       let result = null;
@@ -265,7 +404,7 @@ export default async function handler(req, res) {
         const retryAfter = Math.max(0, Math.floor((result.reset - Date.now()) / 1000));
         res.setHeader('Retry-After', String(retryAfter));
         return res.status(429).json({
-          error: 'Too many sponsorship requests. Slow down! 🐾',
+          error: 'Too many sponsorship requests. Slow down.',
           retryAfterSeconds: retryAfter,
         });
       }
@@ -304,43 +443,55 @@ export default async function handler(req, res) {
 
     // Expire at the end of the current epoch. Our gates reason about a simulation, and a
     // signature that stays valid indefinitely gives a caller unlimited time to arrange
-    // for execution to diverge from it — including across an epoch boundary, which Move
+    // for execution to diverge from it - including across an epoch boundary, which Move
     // code can read through TxContext even when every object input is version-pinned.
     const currentEpoch = await fetchCurrentEpoch(gqlClient);
     if (currentEpoch != null) tx.setExpiration({ Epoch: currentEpoch });
 
-    const { coins, addressBalanceMist, totalBalanceMist } = await fetchSponsorGas(
-      gqlClient,
-      sponsorAddress
-    );
-    // Gas from an address balance is expressed as an EMPTY gas payment (plus an
-    // expiration, since there is no object version to bound replay with). The node
-    // accepts that, but WALLETS DO NOT: an empty payment reads to them as "no gas
-    // selected", so they re-resolve gas against the sender and reject the transaction
-    // with "Gas object is not an owned object with owner: <the user>" — which is fatal
-    // here, because skitty's whole point is users who hold no SUI. A coin object leaves
-    // nothing to re-resolve, so coins are preferred and the balance is only a fallback.
-    const budgetMist = BigInt(SPONSOR_GAS_BUDGET_MIST);
-    const useAddressBalance =
-      coins.length === 0 && currentEpoch != null && addressBalanceMist >= budgetMist;
-
-    if (!useAddressBalance && coins.length === 0) {
-      // An operational problem, not a bad request — say exactly what is wrong rather than
-      // letting it fall through to a generic 500 that hides a one-line fix.
+    let gas = await fetchSponsorGas(gqlClient, sponsorAddress);
+    let coins = coinsCovering(gas.coins, splitToSenderMist);
+    if (coins.length === 0) {
+      // someone topped up and it landed as an address balance: make it usable before
+      // telling this caller to pay their own gas
+      gas = await convertAddressBalance(gqlClient, houseKeypair, gas, splitToSenderMist);
+      coins = coinsCovering(gas.coins, splitToSenderMist);
+    }
+    // gas MUST come from a Coin<SUI> object here. an address balance can nominally pay
+    // gas (empty gas payment + expiration), but not for this app:
+    //   - wallets reject it: an empty payment reads as "no gas selected", so they
+    //     re-resolve against the sender and fail with "Gas object is not an owned object
+    //     with owner: <user>". fatal, since skitty's users hold no SUI.
+    //   - it can't be verified: an address holding ZERO SUI still simulates a successful
+    //     splitCoins(tx.gas), so the net-balance gate below would rubber-stamp a
+    //     transaction that aborts on chain.
+    //   - the protocol ships a switch (address_balance_gas_reject_gas_coin_arg, currently
+    //     off) that rejects a GasCoin argument alongside address-balance gas.
+    // with a coin object the gate is exact: spendable is coinBalance - gasBudget.
+    if (coins.length === 0) {
+      // an operational problem, not a bad request. say exactly what's wrong instead of
+      // falling through to a generic 500 that hides a one-line fix.
       res.setHeader('Retry-After', '30');
-      const detail =
-        totalBalanceMist > 0n
-          ? `it holds ${totalBalanceMist} mist, which does not cover the ${SPONSOR_GAS_BUDGET_MIST} mist gas budget`
-          : 'it is empty';
+      const reason = fundingReason(gas);
+      if (reason === 'ok') {
+        // it can pay gas, just not this batch's payout on top. no fallback: a smaller
+        // batch still gets sponsored.
+        return res.status(503).json({
+          error: `The gas sponsor can't front this batch's ${splitToSenderMist} mist payout right now. Try fewer objects at once.`,
+          code: 'sponsor_insufficient',
+          sponsorAddress,
+        });
+      }
       return res.status(503).json({
-        error: `Sponsor wallet cannot pay gas: ${detail}. Send SUI to the sponsor address as a Coin<SUI> object.`,
+        error: `Sponsor wallet cannot pay gas: ${FUNDING_DETAIL[reason]}. Send SUI to the sponsor address to turn sponsorship back on.`,
+        code: 'sponsor_unfunded',
+        reason,
         sponsorAddress,
       });
     }
 
     if (isSimulateOnly) {
       // never submitted, so it needs no reservation and gets no signature
-      tx.setGasPayment(useAddressBalance ? [] : [coins[0]]);
+      tx.setGasPayment([coins[0]]);
       const builtBytes = await tx.build({ client: gqlClient });
       return res.status(200).json({
         sponsoredTxBytes: Buffer.from(builtBytes).toString('base64'),
@@ -348,18 +499,15 @@ export default async function handler(req, res) {
       });
     }
 
-    if (useAddressBalance) {
-      tx.setGasPayment([]);
-    } else {
-      reservedCoin = await reserveCoin(coins, identifier);
-      if (!reservedCoin) {
-        res.setHeader('Retry-After', '5');
-        return res.status(503).json({
-          error: 'Sponsor is busy; every funded gas coin is reserved. Try again in a moment. 🐾',
-        });
-      }
-      tx.setGasPayment([reservedCoin]);
+    reservedCoin = await reserveCoin(coins, identifier);
+    if (!reservedCoin) {
+      res.setHeader('Retry-After', '5');
+      return res.status(503).json({
+        error: 'Sponsor is busy; every funded gas coin is reserved. Try again in a moment.',
+        code: 'sponsor_busy',
+      });
     }
+    tx.setGasPayment([reservedCoin]);
 
     const builtBytes = await tx.build({ client: gqlClient });
 
@@ -402,7 +550,7 @@ export default async function handler(req, res) {
 
     // 4. Tighten the gas budget to what this batch actually needs. No gate can tell
     //    "will succeed" from "will abort", and an aborted transaction still bills the
-    //    sponsor for computation — the budget is the ceiling on that loss, so keeping it
+    //    sponsor for computation - the budget is the ceiling on that loss, so keeping it
     //    at the generous default would let a caller burn the full amount on purpose.
     //    The budget is a ceiling, not a charge, so raising the headroom does not change
     //    the effects the simulation just verified.

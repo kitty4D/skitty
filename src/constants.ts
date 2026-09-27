@@ -16,8 +16,16 @@ export const FEE_RECIPIENT = '0x0154543c5e9d2db3b12d5b761b204b06620f35561b6065f5
 
 // gas budget for dry-run build; pre-set so GraphQL resolver skips gas selection (fails when balance low)
 export const DRY_RUN_GAS_BUDGET = 50_000_000;
-// when taking fee from gas coin, leave at least this much (mist) for gas so split doesn't fail
-export const GAS_RESERVE_FOR_FEE_MIST = 1_000_000;
+
+// self-paid gas, used whenever the sponsor can't pay. a wallet holding less than the
+// minimum budget can't run anything, which is the whole reason the sponsor exists.
+export const SELF_PAY_MIN_GAS_BUDGET_MIST = 3_000_000;
+export const SELF_PAY_GAS_BUDGET_MARGIN = 1.5;
+// ceiling for the measuring pass only. it runs with an empty gas payment, which
+// simulation never checks against the payer, so this never has to be affordable.
+export const SELF_PAY_DRAFT_GAS_BUDGET_MIST = 1_000_000_000;
+// one page of coins; a gas payment can take up to 256, nobody needs more than this
+export const SELF_PAY_MAX_GAS_COINS = 50;
 
 // estimated gas (mist) per action type for net-gain before dry run
 export const ESTIMATED_GAS = {
@@ -41,7 +49,7 @@ export const SUI_COIN_TYPE_ARG_LONG = '0x000000000000000000000000000000000000000
 
 // core protected types: never suggest burn/destroy for these, even if a burn exists.
 // Package addresses must match what the node actually reports or the guard silently
-// never fires — staking lives in the sui_system package (0x3), and SuiNS types live
+// never fires - staking lives in the sui_system package (0x3), and SuiNS types live
 // in the SuiNS package, not the framework.
 export const CORE_PROTECTED_TYPES: string[] = [
   '0x3::staking_pool::StakedSui',
@@ -54,7 +62,7 @@ export const CORE_PROTECTED_TYPES: string[] = [
   '0x2::coin::TreasuryCap',
   '0x2::coin::CoinMetadata',
   // SuiNS mainnet. Addresses here must be the package that DEFINED the type, which is
-  // what object types report — subdomains arrived in a later upgrade, so they carry a
+  // what object types report - subdomains arrived in a later upgrade, so they carry a
   // different address than the original package.
   '0xd22b24490e0bae52676651b4f56660a5ff8022a2576e0089f79b3c88d44e08f0::suins_registration::SuinsRegistration',
   '0x00c2f85e07181b90c140b15c5ce27d863f93c4d9159d2a4e7bdaeb40e286d6f5::subdomain_registration::SubDomainRegistration',

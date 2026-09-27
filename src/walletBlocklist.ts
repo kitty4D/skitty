@@ -22,7 +22,7 @@ export type ObjectListResponse = {
 
 // The blocklist is the main thing standing between a scam object and a burn
 // suggestion, so a failed fetch must abort the scan rather than quietly return an
-// empty set — an empty set reads as "nothing is blocked" and removes the guard.
+// empty set - an empty set reads as "nothing is blocked" and removes the guard.
 const BLOCKLIST_ERROR =
   'Could not load the Mysten wallet blocklist. Scanning is disabled without it, so nothing unsafe gets suggested. Try again shortly.';
 

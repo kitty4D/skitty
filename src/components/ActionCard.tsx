@@ -45,7 +45,7 @@ export function ActionCard({
   onExecute,
   executing,
   simulating = false,
-  canSponsor = true,
+  executeBlockedReason = null,
 }: {
   action: CleanupAction;
   /** stable id derived from the action's objects, not its position in the list */
@@ -62,8 +62,8 @@ export function ActionCard({
   onExecute: () => void;
   executing: boolean;
   simulating?: boolean;
-  /** false when rebate does not cover gas + fee; single-action execute disabled */
-  canSponsor?: boolean;
+  /** why this can't run right now (unsponsorable, or no SUI for self-paid gas); null if it can */
+  executeBlockedReason?: string | null;
 }) {
   const isDestructive = action.kind === 'burn' || action.kind === 'close_kiosk';
   const isDiscovered = action.kind === 'burn' && (action as BurnAction).discovered;
@@ -133,7 +133,7 @@ export function ActionCard({
               <div className="space-y-1">
                 {(action as MergeCoinsAction).objectIds.map((id, i) => {
                   const balanceMist = (action as MergeCoinsAction).objectBalances?.[i];
-                  const balanceStr = balanceMist != null ? formatSui(Number(balanceMist)) : '—';
+                  const balanceStr = balanceMist != null ? formatSui(Number(balanceMist)) : '-';
                   return (
                     <div key={id} className="flex gap-4 items-center">
                       <a
@@ -158,9 +158,9 @@ export function ActionCard({
                   // name alone, so we cannot vouch for what the object is worth
                   <span
                     className="inline-block px-1.5 py-0.5 bg-amber-400 text-black text-[8px] font-black tracking-widest mb-1"
-                    title="Burn function found by name only — skitty has not verified this object is worthless. Check it before destroying."
+                    title="Burn function found by name only - skitty has not verified this object is worthless. Check it before destroying."
                   >
-                    ⚠ UNVERIFIED BURN
+                    UNVERIFIED BURN
                   </span>
                 )}
                 {action.objectIds.map((id) => (
@@ -212,15 +212,15 @@ export function ActionCard({
                 <FlaskConical className="h-3.5 w-3.5" />
               </button>
               {interactive && (() => {
-                const label = !canSponsor
-                  ? 'Rebate does not cover gas + fee'
+                const label = executeBlockedReason
+                  ? executeBlockedReason
                   : action.kind === 'merge_coins'
                     ? `Merge coins ${shortLabel}`
                     : action.kind === 'destroy_zero'
                       ? `Destroy empty coin ${shortLabel}`
                       : action.kind === 'close_kiosk'
-                        ? `Close kiosk ${shortLabel} — permanent`
-                        : `Burn ${shortLabel} — permanent and irreversible`;
+                        ? `Close kiosk ${shortLabel} (permanent)`
+                        : `Burn ${shortLabel} (permanent and irreversible)`;
                 return (
                   <button
                     type="button"
@@ -228,7 +228,7 @@ export function ActionCard({
                       e.stopPropagation();
                       onExecute();
                     }}
-                    disabled={executing || !canSponsor}
+                    disabled={executing || Boolean(executeBlockedReason)}
                     className={cn(
                       'p-1.5 bg-black border border-white/10 transition-all disabled:opacity-20 shadow-[2px_2px_0_#000]',
                       isDestructive

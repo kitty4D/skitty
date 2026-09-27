@@ -10,7 +10,7 @@ import {
   validateReclaimTransactionKind,
   netSuiChangeForAddress,
   gasCoinNetMist,
-} from '../api/sponsorPolicy.js';
+} from '../lib/sponsorPolicy.js';
 
 const USER = '0x1111111111111111111111111111111111111111111111111111111111111111';
 const ATTACKER = '0x9999999999999999999999999999999999999999999999999999999999999999';
@@ -127,7 +127,7 @@ test('rejects an empty transaction', async () => {
 });
 
 test('an attacker as the declared sender is still capped by the split ceiling', async () => {
-  // Structurally a sender may be paid from the gas coin — that is how the user gets
+  // Structurally a sender may be paid from the gas coin - that is how the user gets
   // their rebate. Two things bound it: the absolute split ceiling here, and the
   // handler's refusal to sign when the simulated sponsor balance goes negative.
   const data = await dataFor((tx) => {
@@ -264,7 +264,7 @@ test('gasCoinNetMist refuses to sign when the payout exceeds the real rebate', (
 });
 
 test('gasCoinNetMist refuses to guess when the gas figures are missing', () => {
-  // absent fields are absent evidence — defaulting them to zero would pass the gate on
+  // absent fields are absent evidence - defaulting them to zero would pass the gate on
   // no data, and would do so precisely for the zero-payout griefing shapes
   expect(gasCoinNetMist(undefined, 0n)).toBe(null);
   expect(gasCoinNetMist({}, 0n)).toBe(null);
@@ -307,8 +307,7 @@ test('netSuiChangeForAddress sums only the sponsor SUI rows', () => {
 });
 
 test('netSuiChangeForAddress refuses to guess when the sponsor has no row', () => {
-  // the sponsor always pays gas, so no row means missing data, not a zero net —
-  // returning 0n here would let the only value gate pass on no evidence
+  // the sponsor always pays gas, so no row means missing data, not a zero net - // returning 0n here would let the only value gate pass on no evidence
   expect(netSuiChangeForAddress([], SPONSOR)).toBe(null);
   expect(netSuiChangeForAddress(undefined, SPONSOR)).toBe(null);
   expect(
