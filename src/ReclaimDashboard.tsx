@@ -35,6 +35,9 @@ import { ActionCard } from './components/ActionCard';
 import { FloatingCart } from './components/FloatingCart';
 import { SponsorStatusBanner } from './components/SponsorStatusBanner';
 
+// k4d.io answers with a permanent redirect to www, so link the destination and skip the hop
+const K4D_URL = 'https://www.k4d.io';
+
 const containerVariants = {
   hidden: { opacity: 0 },
   visible: {
@@ -538,6 +541,14 @@ export function ReclaimDashboard() {
             </div>
           </div>
           <div className="flex items-center gap-4">
+            <a
+              href={K4D_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sm font-black tracking-widest text-white/80 hover:text-white underline decoration-black/40 underline-offset-4 transition-colors"
+            >
+              k4d.io
+            </a>
             <div className="[&_.btn]:!rounded-none [&_.btn]:!border-2 [&_.btn]:!border-black [&_.btn]:!bg-white [&_.btn]:!text-black [&_.btn]:!font-black [&_.btn]:!uppercase [&_.btn]:!shadow-brutal hover:[&_.btn]:!translate-x-[1px] hover:[&_.btn]:!translate-y-[1px] hover:[&_.btn]:!shadow-none transition-all">
               <KitConnectButton />
             </div>
@@ -902,6 +913,14 @@ export function ReclaimDashboard() {
           </a>
           <div className="flex flex-row items-center gap-4">
             <div className="flex items-center gap-3 shrink-0" aria-label="Social links">
+              <a
+                href={K4D_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm font-black tracking-wider text-white/80 hover:text-skitty-accent transition-colors"
+              >
+                k4d.io
+              </a>
               <a
                 href="https://github.com/kitty4D/skitty"
                 target="_blank"

@@ -35,7 +35,7 @@ side effect worth knowing: on the coin route every pinned coin gets smashed into
 
 ## ui
 
-- `SponsorStatusBanner` shows whenever self-paid: title by reason, full sponsor address with copy and explorer link when a top-up would fix it (not when offline).
+- `SponsorStatusBanner` shows whenever self-paid: title by reason, and always the full sponsor address with copy and explorer link. only a confirmed shortage (`unfunded`) gets the "send SUI here" label; offline just says "sponsor wallet", since a missing key isn't fixed by a top-up.
 - `FloatingCart` shows net cost in red when a self-paid batch loses money, labels gas as the wallet's, and takes `executeBlockedReason` instead of the old `canSponsor`.
 - dry-run results carry their `gasMode` and are hidden when the mode flips; per-card simulated yields are cleared on a flip.
 

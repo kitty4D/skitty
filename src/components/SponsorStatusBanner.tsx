@@ -70,36 +70,37 @@ export function SponsorStatusBanner({
           Your connected wallet has no SUI for gas, so it can&apos;t run cleanups right now.
         </p>
       )}
-      {unfunded && (
-        <div className="space-y-1">
-          <p className="text-[10px] font-black uppercase tracking-widest">
-            Sponsor wallet: send SUI here to turn sponsorship back on
-          </p>
-          <div className="flex flex-wrap items-center gap-2">
-            <code className="bg-black text-amber-300 px-2 py-1 text-xs font-bold break-all select-all">
-              {sponsorAddress}
-            </code>
-            <button
-              type="button"
-              onClick={copy}
-              className="flex items-center gap-1 px-2 py-1 border-2 border-black bg-white text-[10px] font-black uppercase tracking-widest hover:bg-black hover:text-amber-300 transition-colors"
-              aria-label="Copy sponsor wallet address"
-            >
-              {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-              {copied ? 'Copied' : 'Copy'}
-            </button>
-            <a
-              href={`${SUIVISION_ACCOUNT_URL}/${sponsorAddress}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center gap-1 px-2 py-1 border-2 border-black bg-white text-[10px] font-black uppercase tracking-widest hover:bg-black hover:text-amber-300 transition-colors"
-            >
-              <ExternalLink className="w-3 h-3" />
-              View
-            </a>
-          </div>
+      {/* shown in every state. offline usually just means the status check failed, and
+          the sponsor may well be empty behind it, but only a confirmed shortage gets the
+          "send SUI here" pitch: when it's the key that's missing, a top-up fixes nothing */}
+      <div className="space-y-1">
+        <p className="text-[10px] font-black uppercase tracking-widest">
+          {unfunded ? 'Sponsor wallet: send SUI here to turn sponsorship back on' : 'Sponsor wallet'}
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <code className="bg-black text-amber-300 px-2 py-1 text-xs font-bold break-all select-all">
+            {sponsorAddress}
+          </code>
+          <button
+            type="button"
+            onClick={copy}
+            className="flex items-center gap-1 px-2 py-1 border-2 border-black bg-white text-[10px] font-black uppercase tracking-widest hover:bg-black hover:text-amber-300 transition-colors"
+            aria-label="Copy sponsor wallet address"
+          >
+            {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+          <a
+            href={`${SUIVISION_ACCOUNT_URL}/${sponsorAddress}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1 px-2 py-1 border-2 border-black bg-white text-[10px] font-black uppercase tracking-widest hover:bg-black hover:text-amber-300 transition-colors"
+          >
+            <ExternalLink className="w-3 h-3" />
+            View
+          </a>
         </div>
-      )}
+      </div>
     </motion.div>
   );
 }
