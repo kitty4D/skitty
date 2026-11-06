@@ -18,6 +18,8 @@ export interface CleanupActionBase {
   label?: string;
   /** withdrawals don't earn a storage rebate and must pay their own gas */
   selfPaidOnly?: boolean;
+  /** opt-in cleanup of a flagged coin needs an additional explicit confirmation */
+  walletWarning?: string;
 }
 
 export interface MergeCoinsAction extends CleanupActionBase {
@@ -89,6 +91,8 @@ export interface ScanProgress {
 }
 
 export interface ScannerState {
+  blockedCoins?: BlockedCoin[];
+  flaggedActions?: CleanupAction[];
   warnings?: string[];
   loading: boolean;
   error: string | null;
@@ -99,4 +103,11 @@ export interface ScannerState {
   scannedAddress: string | null;
   /** set while scan in progress; null when idle or done */
   scanProgress: ScanProgress | null;
+}
+
+export interface BlockedCoin {
+  objectId: string;
+  coinType: string;
+  balance: string | null;
+  reason: import('./walletBlocklist').CoinBlockReason;
 }

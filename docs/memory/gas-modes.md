@@ -6,7 +6,7 @@
 
 `useSponsorStatus` polls every 60 seconds. `checking` is optimistic, `funded` requests sponsorship, and `unfunded` or `offline` uses the wallet. a funded status means a coin exceeds the initial sponsor budget, not that it can front every batch
 
-the user can explicitly choose "pay gas with my wallet" while the sponsor is checking or funded. it's off by default and resets on wallet change. changing the choice clears pending confirmation. it doesn't rerun a failed transaction
+after a scan, the gas-payment fieldset sits between the results summary and cleanup panels while the sponsor is checking or funded. it explains both radio options before selection: sponsorship for eligible cleanups, or the wallet's existing SUI for gas. sponsorship is selected by default. the choice resets on wallet change and clears pending confirmation. it doesn't rerun a failed transaction. kiosk withdrawals still force the queue self-paid, with a visible explanation
 
 a kiosk-proceeds withdrawal forces the entire queue self-paid. it releases earnings without deleting storage. proceeds aren't included in the service-fee base
 
@@ -18,7 +18,7 @@ the browser builds transaction-kind bytes. the server validates the shape, choos
 
 execution measures gross gas, rebuilds the included batch, then requests the sponsor signature. the signing path simulates again and checks both gas-coin arithmetic and the sponsor's SUI balance change. the wallet signs the returned transaction and the client submits both signatures
 
-rebates go to the gas payer. the sponsor therefore sends the user's share from its existing coin during execution. the fee stays in that coin. the initial selection check is `coin balance >= 50,000,000 mist + payout`; the signed budget is tightened later
+rebates go to the gas payer. the sponsor therefore splits the user's share from its existing coin and sends it into sender address balance with `coin::send_funds<SUI>`. a new payout coin would recreate the storage being cleaned up. the policy counts that split exactly as it counts an object-transfer payout. the fee stays in the gas coin. initial selection requires `coin balance >= 50,000,000 mist + payout`; the signed budget is tightened later
 
 ## self-paid path
 
@@ -44,5 +44,6 @@ the fee is waived when `userRebate - gas - fee <= 0`. storage accounting uses on
 - disconnecting or changing wallets clears feedback, simulations, explanations, and pending confirmations. epochs reject late responses from the old wallet session
 - an active execution stays locked until it settles. a wallet switch doesn't cancel a transaction already submitted
 - finality timeout is reported as pending, not as proof of failure. an onchain abort isn't reported as success
+- known quote limit: if a fee included in the measuring draft is waived in the final build, `build.gasMist` can remain conservatively high. a november 6 read-only SUI deposit had positive final simulated inflow despite negative fallback `netGainMist`. prefer final balance changes for that simulation; don't describe the rough card estimate as a measured profit
 
 related: [coin cleanup](coin-cleanup.md), [object cleanup](object-cleanup.md), [gas observations](sui-gas-facts.md)

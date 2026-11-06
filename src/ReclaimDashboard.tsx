@@ -17,7 +17,7 @@ import {
 } from './sponsoredTx';
 import { useSponsorStatus } from './useSponsorStatus';
 import { useSuiHoldings } from './useSuiHoldings';
-import { actionKey, actionDomId, selectActionKeys } from './actionIdentity';
+import { actionKey, actionDomId, selectActionKeys, bulkSelectableActions } from './actionIdentity';
 import { selectCleanupGas } from './gasSelection';
 import { totalNonOverlappingNetGainMist } from './coinActions';
 import { SELF_PAY_MIN_GAS_BUDGET_MIST } from './constants';
@@ -38,6 +38,7 @@ import { WarningsBlock } from './components/WarningsBlock';
 import { ActionCard } from './components/ActionCard';
 import { FloatingCart } from './components/FloatingCart';
 import { SponsorStatusBanner } from './components/SponsorStatusBanner';
+import { GasPaymentChoice } from './components/GasPaymentChoice';
 
 // k4d.io answers with a permanent redirect to www, so link the destination and skip the hop
 const reviewKinds = new Set<CleanupAction['kind']>(['empty_container', 'expired_walrus', 'withdraw_kiosk', 'revoke_allowance']);
@@ -147,7 +148,7 @@ export function ReclaimDashboard() {
   const noGasReason =
     gasMode === 'self' && walletHasNoGas
       ? sponsorshipAvailable
-        ? 'fund your wallet with SUI for gas or turn off wallet-paid gas to use sponsorship for eligible actions.'
+        ? 'fund your wallet with SUI for gas or choose sponsorship for eligible actions.'
         : 'fund your wallet with SUI for gas or wait for sponsorship to return for eligible actions.'
       : null;
 
@@ -210,6 +211,7 @@ export function ReclaimDashboard() {
   const [simulating, setSimulating] = React.useState(false);
   /** actions awaiting an explicit "yes, destroy these" before we ask the wallet to sign */
   const [pendingConfirm, setPendingConfirm] = React.useState<CleanupAction[] | null>(null);
+  const [showFlaggedCoins, setShowFlaggedCoins] = React.useState(false);
   const simulationEpochRef = React.useRef(0);
   const walletEpochRef = React.useRef(0);
 
@@ -218,6 +220,7 @@ export function ReclaimDashboard() {
     walletEpochRef.current += 1;
     simulationEpochRef.current += 1;
     setPayGasWithWallet(false);
+    setShowFlaggedCoins(false);
     setExecuteError(null);
     setExecuteNotice(null);
     setDryRunResult(null);
@@ -235,22 +238,28 @@ export function ReclaimDashboard() {
   // keyed by action identity, not list position: a re-scan reorders state.actions and
   // positional keys would silently re-point the cart at different objects
   const [selectedKeys, setSelectedKeys] = React.useState<Set<string>>(new Set());
+  const availableActions = React.useMemo(() => [
+    ...state.actions, ...(showFlaggedCoins ? state.flaggedActions ?? [] : []),
+  ], [state.actions, state.flaggedActions, showFlaggedCoins]);
+  React.useEffect(() => {
+    if (state.loading) { setShowFlaggedCoins(false); setPendingConfirm(null); }
+  }, [state.loading]);
 
   const toggleAction = React.useCallback((key: string) => {
     setSelectedKeys((prev) => {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else {
-        const action = state.actions.find((candidate) => actionKey(candidate) === key);
-        if (action) return selectActionKeys(state.actions, prev, [action]);
+        const action = availableActions.find((candidate) => actionKey(candidate) === key);
+        if (action) return selectActionKeys(availableActions, prev, [action]);
       }
       return next;
     });
-  }, [state.actions]);
+  }, [availableActions]);
 
   const selectedActionList = React.useMemo(
-    () => state.actions.filter((a) => selectedKeys.has(actionKey(a))),
-    [state.actions, selectedKeys]
+    () => availableActions.filter((a) => selectedKeys.has(actionKey(a))),
+    [availableActions, selectedKeys]
   );
 
   const forcedSelf = selectedActionList.some((a) => a.selfPaidOnly || a.kind === 'withdraw_kiosk');
@@ -444,7 +453,7 @@ export function ReclaimDashboard() {
     (actions: CleanupAction[]) => {
       // a second flow over the same objects can equivocate them, so one at a time
       if (actions.length === 0 || executing) return;
-      const needsConfirmation = actions.some((a) => a.kind === 'burn' || a.kind === 'close_kiosk' || a.kind === 'keep_tokens' || reviewKinds.has(a.kind));
+      const needsConfirmation = actions.some((a) => a.walletWarning || a.kind === 'burn' || a.kind === 'close_kiosk' || a.kind === 'keep_tokens' || reviewKinds.has(a.kind));
       if (needsConfirmation) setPendingConfirm(actions);
       else void performExecute(actions);
     },
@@ -557,7 +566,7 @@ export function ReclaimDashboard() {
       const allSelected = keys.length > 0 && keys.every((k) => prev.has(k));
       const next = new Set(prev);
       if (allSelected) keys.forEach((k) => next.delete(k));
-      else return selectActionKeys(state.actions, prev, items.map(({ action }) => action));
+      else return selectActionKeys(availableActions, prev, bulkSelectableActions(items.map(({ action }) => action)));
       return next;
     });
   };
@@ -574,12 +583,12 @@ export function ReclaimDashboard() {
 
   // drop selections whose action no longer exists after a re-scan or refresh
   React.useEffect(() => {
-    const live = new Set(state.actions.map(actionKey));
+    const live = new Set(availableActions.map(actionKey));
     setSelectedKeys((prev) => {
       const next = new Set([...prev].filter((k) => live.has(k)));
       return next.size === prev.size ? prev : next;
     });
-  }, [state.actions]);
+  }, [availableActions]);
 
   return (
     <div className="min-h-screen flex flex-col bg-black font-body text-white selection:bg-skitty-accent selection:text-white">
@@ -645,7 +654,7 @@ export function ReclaimDashboard() {
         )}
       </AnimatePresence>
 
-      <main className="mx-auto max-w-5xl px-6 py-12 space-y-12 pb-48">
+      <main className="mx-auto w-full min-w-0 max-w-5xl px-6 py-12 space-y-12 pb-48">
         <AnimatePresence>
           {!sponsorshipAvailable && (
             <SponsorStatusBanner
@@ -657,30 +666,6 @@ export function ReclaimDashboard() {
             />
           )}
         </AnimatePresence>
-
-        {sponsorshipAvailable && (
-          <div className="border border-white/20 bg-white/5 p-4 space-y-2">
-            <label className="flex items-center gap-3 text-sm cursor-pointer">
-              <input
-                type="checkbox"
-                checked={payGasWithWallet}
-                disabled={executing || simulating}
-                onChange={(event) => {
-                  setPayGasWithWallet(event.target.checked);
-                  setPendingConfirm(null);
-                }}
-                className="accent-skitty-accent"
-              />
-              pay gas with my wallet
-            </label>
-            {payGasWithWallet && (
-              <p className="text-sm text-amber-400" role="status">
-                you chose wallet-paid gas. your wallet covers the cost even when storage rebates don't cover gas. sponsorship remains available for eligible actions when you turn this off. nothing runs until you simulate or execute.
-              </p>
-            )}
-            {payGasWithWallet && noGasReason && <p className="text-sm text-amber-400">{noGasReason}</p>}
-          </div>
-        )}
 
         <motion.div
           initial={{ y: 20, opacity: 0 }}
@@ -826,6 +811,19 @@ export function ReclaimDashboard() {
               </div>
             </div>
 
+            {sponsorshipAvailable && (
+              <GasPaymentChoice
+                payWithWallet={payGasWithWallet}
+                onChange={(value) => {
+                  setPayGasWithWallet(value);
+                  setPendingConfirm(null);
+                }}
+                disabled={executing || simulating}
+                requiresWalletGas={forcedSelf}
+                blockedReason={forcedSelf ? forcedNoGasReason : payGasWithWallet ? noGasReason : null}
+              />
+            )}
+
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
               {kindOrder.map((kind) => {
                 const items = actionsByKind.get(kind) ?? [];
@@ -907,10 +905,51 @@ export function ReclaimDashboard() {
                 );
               })}
             </div>
+            {!!state.blockedCoins?.length && (
+              <section aria-labelledby="blocked-coins-title" className="border-t border-amber-300/40 pt-5">
+                <h3 id="blocked-coins-title" className="text-lg font-bold text-amber-300">flagged coins, excluded from Select All ({state.blockedCoins.length})</h3>
+                <p className="mt-2 max-w-prose text-sm leading-relaxed text-white/80">
+                  these match Mysten's public blocklists or an exact coin type reported blocked by Slush. Select All never includes them, even when unhidden. a wallet refusal doesn't establish that a token is a scam
+                </p>
+                <label className="mt-4 flex cursor-pointer items-start gap-3 text-sm text-white">
+                  <input type="checkbox" checked={showFlaggedCoins} disabled={executing || simulating}
+                    onChange={event => { setShowFlaggedCoins(event.target.checked); setPendingConfirm(null); }}
+                    aria-describedby="flagged-coin-help" className="mt-1 h-4 w-4 shrink-0 accent-skitty-accent" />
+                  show cleanup options for flagged coins
+                </label>
+                <p id="flagged-coin-help" className="mt-2 max-w-prose text-sm leading-relaxed text-amber-200">
+                  another wallet may allow these framework-only coin cleanups. unhide them to choose individually. your wallet can still refuse, simulation isn't a security audit, and nothing runs until you approve it
+                </p>
+                <ul className="action-panel-scroll mt-4 max-h-80 overflow-y-auto divide-y divide-white/15">
+                  {state.blockedCoins.map(coin => (
+                    <li key={coin.objectId} className="space-y-2 py-4 text-sm">
+                      <p className="break-all text-white">{coin.coinType}</p>
+                      <p className="break-all text-amber-200">{coin.reason.kind === 'package' ? `package is blocklisted: ${coin.reason.packageId}` : coin.reason.kind === 'wallet' ? 'reported blocked by Slush' : 'coin type is blocklisted'}</p>
+                      <a className="inline-block break-all text-skitty-accent underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4" href={`https://suivision.xyz/object/${coin.objectId}`} target="_blank" rel="noopener noreferrer">view coin {shortenAddress(coin.objectId)}</a>
+                      <p className="text-white/80">balance: {coin.balance === null ? 'unknown' : `${coin.balance} raw units`}</p>
+                    </li>
+                  ))}
+                </ul>
+                {showFlaggedCoins && (
+                  <ul className="action-panel-scroll mt-5 max-h-[450px] space-y-4 overflow-y-auto">
+                    {(state.flaggedActions ?? []).map(action => {
+                      const key = actionKey(action);
+                      return <ActionCard key={key} action={action} domId={actionDomId(action)} selected={selectedKeys.has(key)}
+                        onToggle={() => toggleAction(key)} shortLabel={`${kindTitles[action.kind]}: ${shortLabelFromType(action.label ?? '')}`}
+                        interactive={scannedAddressIsConnectedWallet} showSimulate gasMode={gasModeForActions([action],gasMode)}
+                        notEconomical={action.netGainMist < 0} simulatedNetInflowMist={simulatedNetInflowByKey[key]}
+                        onDryRun={() => runSimulation([action],key)} onExecute={() => requestExecute([action])}
+                        executing={executing} simulating={simulating} executeBlockedReason={gasMode === 'self' ? noGasReason : null} />;
+                    })}
+                    {!state.flaggedActions?.length && <li className="text-sm text-white/80">no supported coin cleanup is available for these objects</li>}
+                  </ul>
+                )}
+              </section>
+            )}
           </motion.div>
         )}
 
-        {!state.loading && state.scannedAddress && state.actions.length === 0 && state.error === null && (
+        {!state.loading && state.scannedAddress && state.actions.length === 0 && !state.blockedCoins?.length && state.error === null && (
           <motion.div
             initial={{ scale: 0.9, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
@@ -1117,6 +1156,7 @@ export function ReclaimDashboard() {
                       <div className="min-w-0 space-y-2 normal-case">
                         <p>{kindTitles[a.kind]}: {a.label ?? a.objectIds[0]}</p>
                         {reviewKinds.has(a.kind) && <p>{kindDescriptions[a.kind]}</p>}
+                        {a.walletWarning && <p className="text-amber-300">{a.walletWarning} Select All did not choose this action.</p>}
                         {'details' in a && a.details.map((detail, index) => <p key={index} className="break-all">{detail}</p>)}
                         {a.kind === 'withdraw_kiosk' && <p>observed proceeds: {formatSui(Number(a.proceedsMist))} SUI. destination: {account?.address}</p>}
                         {'moveTarget' in a && <p className="break-all">call: {a.moveTarget}{'typeArguments' in a ? ' ' + a.typeArguments.join(', ') : ''}</p>}

@@ -1,6 +1,10 @@
 import type { CleanupAction } from './types';
 import { normalizeSuiObjectId } from '@mysten/sui/utils';
 
+export function bulkSelectableActions(actions: CleanupAction[]): CleanupAction[] {
+  return actions.filter(action => !action.walletWarning);
+}
+
 // alternative actions consume the same objects. a new choice replaces conflicting
 // selections so the queue never promises two rebates for deleting one coin.
 export function selectActionKeys(

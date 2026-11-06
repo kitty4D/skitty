@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { selectActionKeys, actionKey } from './actionIdentity';
+import { selectActionKeys, actionKey, bulkSelectableActions } from './actionIdentity';
 import type { CleanupAction } from './types';
 
 const merge: CleanupAction = {
@@ -8,6 +8,15 @@ const merge: CleanupAction = {
   userRebateMist: 990, estimatedGasMist: 1, netGainMist: 989,
 };
 const keep: CleanupAction = { ...merge, kind: 'keep_tokens', objectIds: ['0xb'] };
+
+it('unhidden flagged actions stay outside bulk selection but remain individually selectable', () => {
+  const flagged: CleanupAction = {...keep,objectIds:['0xc'],walletWarning:'reported blocked by Slush'};
+  const actions=[keep,flagged];
+  expect(bulkSelectableActions(actions)).toEqual([keep]);
+  const bulk=selectActionKeys(actions,new Set(),bulkSelectableActions(actions));
+  expect(bulk.has(actionKey(flagged))).toBe(false);
+  expect(selectActionKeys(actions,bulk,[flagged])).toEqual(new Set([actionKey(keep),actionKey(flagged)]));
+});
 
 it('choosing keep tokens replaces an overlapping merge selection', () => {
   expect([...selectActionKeys([merge, keep], new Set([actionKey(merge)]), [keep])])

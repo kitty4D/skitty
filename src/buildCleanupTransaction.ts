@@ -384,7 +384,12 @@ export function buildBatchTransaction(
     // its net change per batch becomes rebate - gross gas - userShare, i.e. the fee.
     if (userShareMist > 0) {
       const [userCoin] = tx.splitCoins(tx.gas, [userShareMist]);
-      tx.transferObjects([userCoin], tx.pure.address(options.senderAddress));
+      // paying as a coin would replace the wrapper we just removed with another one.
+      tx.moveCall({
+        target: COIN_SEND_FUNDS_TARGET,
+        typeArguments: [SUI_COIN_TYPE_ARG],
+        arguments: [userCoin, tx.pure.address(options.senderAddress)],
+      });
     }
   } else if (feeMist > 0 && selfPaidFee) {
     // the fee lands in the recipient's address balance, not as a new coin object. a coin

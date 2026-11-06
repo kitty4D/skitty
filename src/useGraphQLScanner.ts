@@ -20,10 +20,12 @@ import { KNOWN_BURNABLE } from './constants';
 import {
   getCoinTypeArg,
   getWalletCoinBlocklist,
+  getWalletPackageBlocklist,
+  refreshWalletBlocklists,
   getWalletObjectBlocklist,
   isObjectTypeBlockedIn,
 } from './walletBlocklist';
-import { generateCoinActions, parseCoinBalance, totalUniqueUserRebateMist } from './coinActions';
+import { generateCoinActions, partitionBlockedCoins, parseCoinBalance, totalUniqueUserRebateMist } from './coinActions';
 import type { CoinMetadata } from './coinActions';
 import { discoverContainers, containerType } from './containerDiscovery';
 import { discoverReceipts, isReceiptType } from './receiptDiscovery';
@@ -79,11 +81,14 @@ export function useGraphQLScanner(address: string | null) {
       error: null,
       actions: [],
       warnings: [],
+      blockedCoins: [],
+      flaggedActions: [],
       totalUserRebateMist: 0,
       scannedAddress: address,
     }));
 
     try {
+      refreshWalletBlocklists();
       const updateProgress = (progress: ScanProgress) => {
         if (isStale()) return;
         setState(prev => ({ ...prev, scanProgress: progress }));
@@ -121,7 +126,7 @@ export function useGraphQLScanner(address: string | null) {
       if (isStale()) return;
 
       const actions: CleanupAction[] = [
-        ...coinResults,
+        ...coinResults.actions,
         ...kioskResult,
         ...burnableResult,
         ...allowedExtras,
@@ -133,6 +138,8 @@ export function useGraphQLScanner(address: string | null) {
         loading: false,
         scanProgress: null,
         actions,
+        blockedCoins: coinResults.blockedCoins,
+        flaggedActions: coinResults.flaggedActions,
         warnings,
         totalUserRebateMist,
         scannedAddress: address,
@@ -167,6 +174,8 @@ export function useGraphQLScanner(address: string | null) {
       totalUserRebateMist: 0,
       scannedAddress: null,
       warnings: [],
+      blockedCoins: [],
+      flaggedActions: [],
     }));
   }, [address]);
 
@@ -177,7 +186,7 @@ export function useGraphQLScanner(address: string | null) {
 async function findCoinActionsByGraphQL(
   address: string,
   updateProgress: (progress: ScanProgress) => void
-): Promise<CleanupAction[]> {
+): Promise<{actions: CleanupAction[]; blockedCoins: import('./types').BlockedCoin[]; flaggedActions: CleanupAction[]}> {
   updateProgress({ phase: 'fetching coins', current: 0, total: 1 });
 
   const PAGE_SIZE = 50;
@@ -228,10 +237,11 @@ async function findCoinActionsByGraphQL(
     }
     updateProgress({ phase: 'analyzing coins', current: 0, total: coins.length });
 
-    const blocklist = await getWalletCoinBlocklist();
+    const [blocklist, packageBlocklist] = await Promise.all([getWalletCoinBlocklist(), getWalletPackageBlocklist()]);
+    const {allowed, blockedCoins} = partitionBlockedCoins(coins, blocklist, packageBlocklist);
     const metadata = new Map<string, CoinMetadata>();
     const blocked = new Set([...blocklist].map(normalizeTypeAddress));
-    const types = new Set(coins.filter(coin => {
+    const types = new Set(allowed.filter(coin => {
       const balance = parseCoinBalance(coin.contents?.json);
       return balance !== null && balance > 0n;
     }).map(coin => coin.contents?.type?.repr).filter((type): type is string => !!type));
@@ -250,7 +260,12 @@ async function findCoinActionsByGraphQL(
         // display metadata is optional; retain raw balances when unavailable.
       }
     }
-    return generateCoinActions(coins, blocklist, metadata);
+    const flaggedIds = new Set(blockedCoins.map(coin => coin.objectId));
+    const flaggedActions = generateCoinActions(coins.filter(coin => flaggedIds.has(coin.address)), new Set()).map(action => ({
+      ...action,
+      walletWarning:'this coin type or package is flagged. your wallet may refuse to sign. this is an explicit cleanup request, not a verification that the token is legitimate.',
+    }));
+    return {actions:generateCoinActions(allowed, blocklist, metadata),blockedCoins,flaggedActions};
   }
 }
 

@@ -6,7 +6,7 @@
 
 - supported coin merges with owned inputs
 - `coin::destroy_zero`
-- `coin::send_funds<T>` with one owned, version-pinned input and a literal recipient equal to the sender. no results, gas references, shared coins, or sponsor/third-party destinations
+- `coin::send_funds<T>` with one owned, version-pinned input and a literal sender recipient. sponsor payouts also permit tracked earlier gas-split results with SUI type, counting the amount in `splitToSenderMist`. arbitrary results, direct gas references, shared coins, and sponsor/third-party deposit destinations are rejected
 - framework `kiosk::close_and_withdraw`, with an owned cap. the kiosk argument can be shared
 - exact framework `destroy_empty` calls for Bag/ObjectBag and Table/ObjectTable, with zero or two type arguments respectively. one owned, version-pinned object argument
 - framework `allowance::revoke<T>`, with owned cap first and owned/shared allowance second. the framework checks their pairing and deletes both
@@ -30,6 +30,8 @@ storageRebate - computationCost - storageCost - splitToSenderMist >= 0
 the secondary gate requires nonnegative sponsor SUI balance change. missing gas fields or a missing sponsor balance row return `null` and cause rejection. absent evidence isn't zero loss
 
 the gas coin can appear only as a split source. total gas splits are capped at 2,000,000,000 mist. the sponsor may only receive transferred results originating in its own gas splits. the browser normally leaves the fee in the gas coin rather than splitting it
+
+sender payouts now use address balance rather than a replacement SUI coin. `send_funds` is not an uncounted exit: known gas-split amounts are added to the primary arithmetic gate. bare results from multi-amount splits, future/unknown result origins, and non-SUI type substitutions are rejected. keep regression coverage for both old object-transfer payouts and new address-balance payouts
 
 simulate-only requests get bytes without a signature. the real signing path performs the simulation and value gates before signing
 

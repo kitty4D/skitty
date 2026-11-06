@@ -13,6 +13,14 @@ const action: KeepTokensAction = {
 };
 
 describe('keep tokens', () => {
+  it('pays sponsored recovery into the sender balance without creating a replacement coin', () => {
+    const built=buildBatchTransaction([action],{senderAddress:SENDER,sponsoredGas:true});
+    const commands=built.tx.getData().commands;
+    expect(commands.some(command=>command.$kind==='TransferObjects')).toBe(false);
+    expect(commands[commands.length-1]?.MoveCall).toMatchObject({function:'send_funds',typeArguments:['0x2::sui::SUI']});
+    expect(commands[commands.length-1]?.MoveCall?.arguments[0].$kind).toBe('NestedResult');
+    expect(built.userShareMist).toBeGreaterThan(0);
+  });
   it('consumes coins into the sender balance and reclaims all their storage', () => {
     const built = buildBatchTransaction([action], { senderAddress: SENDER });
     expect(built.storageRebateMist).toBe(6000000);

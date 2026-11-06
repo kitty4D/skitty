@@ -26,6 +26,10 @@ the four object panels stay visible after scanning even when empty. incomplete d
 
 token balances use metadata when available. otherwise they're shown in raw units. depositing tokens into an address balance doesn't sell them for SUI. applications that need coin objects can withdraw them later
 
+coins matching Mysten's coin-type or package blocklist, plus exact types reported blocked by Slush, appear under **flagged coins, excluded from Select All**. the list shows the reason and object links. you can explicitly reveal framework-only cleanup options and choose them individually, with an additional warning before signing. Select All never chooses them, even when visible. hiding them again removes their selections. another wallet may allow the action, but skitty can't override a wallet's refusal
+
+each new scan revalidates the public lists. your wallet can apply additional screening, so absence from the flagged section isn't a promise it will sign
+
 ## gas and fees
 
 the fee rate is 13.69% of the storage rebate the batch is planned to reclaim. it doesn't apply to token balances or withdrawn kiosk proceeds. the quote applies the app's 0.99 rebate multiplier before subtracting gas and the fee. simulation shows network effects, which can differ from the estimate
@@ -40,7 +44,7 @@ the fee recipient is also the sponsor:
 0x0154543c5e9d2db3b12d5b761b204b06620f35561b6065f5a793889fcd148eb1
 ```
 
-when the sponsor can cover an eligible cleanup, a wallet with no SUI can still run it. the sponsor pays gas, receives the storage rebate, and sends your quoted share back. the fee stays in its gas coin
+when the sponsor can cover an eligible cleanup, a wallet with no SUI can still run it. the sponsor pays gas, receives the storage rebate, and sends your quoted share into your address balance. the fee stays in its gas coin. the payout doesn't create another SUI coin for the scanner to offer again
 
 a batch can be refused if it doesn't cover its costs or needs more payout than the available coin can front. try fewer objects, or choose **pay gas with my wallet**
 
@@ -48,7 +52,7 @@ a batch can be refused if it doesn't cover its costs or needs more payout than t
 
 when sponsorship is unavailable, your wallet pays gas. the banner shows the full sponsor address with copy and explorer links. it asks for funding only when a shortage is confirmed. an offline API or missing key isn't fixed by sending SUI
 
-you can also choose **pay gas with my wallet** while sponsorship is available. it's off by default. changing the choice updates the quote and clears pending confirmation. it doesn't retry a failed transaction for you
+after scanning, the **gas payment** section beside the cleanup results explains both choices: use sponsorship or **pay gas with my wallet**. sponsorship is selected by default while available. choosing your wallet requires SUI already available for gas. changing the choice updates the quote and clears pending confirmation. it doesn't retry a failed transaction for you
 
 kiosk proceeds withdrawal always uses your gas, including in a mixed queue. it doesn't delete storage to pay for sponsorship
 

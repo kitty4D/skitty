@@ -246,7 +246,7 @@ test.each([
   );
 });
 
-test('rejects laundering a sponsor gas split through send_funds', async () => {
+test('counts sponsor gas splits paid into the sender address balance', async () => {
   const data = await dataFor((tx) => {
     const [coin] = tx.splitCoins(tx.gas, [1_000_000]);
     tx.moveCall({
@@ -255,7 +255,39 @@ test('rejects laundering a sponsor gas split through send_funds', async () => {
       arguments: [coin, tx.pure.address(USER)],
     });
   });
-  expect(() => check(data)).toThrow(/owned, version-pinned/);
+  expect(check(data)).toEqual({totalSplitFromGas:1_000_000n,splitToSenderMist:1_000_000n});
+  expect(gasCoinNetMist({storageRebate:'1500000',computationCost:'1000000',storageCost:'0'},check(data).splitToSenderMist)).toBe(-500000n);
+});
+
+test.each([SPONSOR,ATTACKER])('rejects routing a gas-split address payout to %s',async recipient=>{
+  const data=await dataFor(tx=>{
+    const [coin]=tx.splitCoins(tx.gas,[1000000]);
+    tx.moveCall({target:'0x2::coin::send_funds',typeArguments:['0x2::sui::SUI'],arguments:[coin,tx.pure.address(recipient)]});
+  });
+  expect(()=>check(data)).toThrow(/literal.*sender/);
+});
+
+test('rejects unsupported result origins, type substitution, and bare multi-split results for address payouts',async()=>{
+  const make=()=>dataFor(tx=>{
+    const [a,b]=tx.splitCoins(tx.gas,[1000,2000]);
+    tx.moveCall({target:'0x2::coin::send_funds',typeArguments:['0x2::sui::SUI'],arguments:[a,tx.pure.address(USER)]});
+    tx.moveCall({target:'0x2::coin::send_funds',typeArguments:['0x2::sui::SUI'],arguments:[b,tx.pure.address(USER)]});
+  });
+  const good=await make();
+  expect(check(good).splitToSenderMist).toBe(3000n);
+  const bare=await make();
+  bare.commands[1].MoveCall.arguments[0]={$kind:'Result',Result:0};
+  expect(()=>check(bare)).toThrow(/multi-value split/);
+  const changed=await make();
+  changed.commands[1].MoveCall.typeArguments=['0xabc::t::T'];
+  expect(()=>check(changed)).toThrow(/SUI type/);
+  const future=await make();
+  future.commands[1].MoveCall.arguments[0]={$kind:'NestedResult',NestedResult:[2,0]};
+  expect(()=>check(future)).toThrow(/tracked gas split/);
+  const fake=await make();
+  fake.commands[0]={$kind:'MoveCall',MoveCall:{package:'0xdead',module:'nft',function:'burn',arguments:[{$kind:'Input',Input:0}],typeArguments:[]}};
+  fake.inputs[0]={$kind:'Object',Object:{$kind:'ImmOrOwnedObject',ImmOrOwnedObject:ref(OBJ_A)}};
+  expect(()=>check(fake)).toThrow(/tracked gas split/);
 });
 
 test('accepts a normal reclaim batch', async () => {

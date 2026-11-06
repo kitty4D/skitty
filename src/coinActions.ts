@@ -1,6 +1,7 @@
 import { ESTIMATED_GAS, MAX_MERGES_PER_BATCH, REBATE_MULTIPLIER, isSameMoveType, normalizeTypeAddress } from './constants';
 import { computeFeeMist } from './buildCleanupTransaction';
-import { getCoinTypeArg } from './walletBlocklist';
+import { getCoinTypeArg, blockedCoinReason } from './walletBlocklist';
+import type { BlockedCoin } from './types';
 import type { CleanupAction, DestroyZeroAction, KeepTokensAction, MergeCoinsAction } from './types';
 import { normalizeStructTag } from '@mysten/sui/utils';
 
@@ -13,6 +14,22 @@ export interface CoinNode {
 export interface CoinMetadata {
   tokenSymbol?: string;
   tokenDecimals?: number;
+}
+
+export function partitionBlockedCoins(coins: CoinNode[], coinTypes: Set<string>, packages: Set<string>) {
+  const normalized = new Set([...coinTypes].map(normalizeTypeAddress));
+  const allowed: CoinNode[] = [];
+  const blockedCoins: BlockedCoin[] = [];
+  const seen = new Set<string>();
+  for (const coin of coins) {
+    if (seen.has(coin.address)) continue;
+    seen.add(coin.address);
+    const coinType = coin.contents?.type?.repr;
+    const reason = coinType ? blockedCoinReason(coinType, normalized, packages) : null;
+    if (reason && coinType) blockedCoins.push({objectId:coin.address,coinType,balance:parseCoinBalance(coin.contents?.json)?.toString() ?? null,reason});
+    else allowed.push(coin);
+  }
+  return { allowed, blockedCoins };
 }
 
 export function parseCoinBalance(json: unknown): bigint | null {

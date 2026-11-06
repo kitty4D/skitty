@@ -23,6 +23,8 @@ read [project memory](docs/memory/MEMORY.md) before changing gas, sponsorship, d
 - empty-payment simulation doesn't prove the payer can afford gas. self-paid planning checks holdings separately
 - self-paid address-balance transactions never reference `tx.gas`. fees use withdrawal/redeem/send. coin-paid fees use `coin::send_funds`, avoiding a new fee coin
 - keep-token deposits go only to the sender's address balance. exclude all gas-payment coins. overlapping actions can't share inputs. coin-paid SUI consolidation uses the gas coin
+- coin cleanup revalidates Mysten's coin-type/package lists each scan. flagged coins stay outside Select All and normal totals. explicit unhide allows individual framework-only cleanup with confirmation. hide/rescan/wallet change clears the opt-in. wallet refusals aren't scam verdicts
+- sponsored user payouts use `coin::send_funds<SUI>` into sender address balance, not replacement coin objects. policy accepts only tracked gas-split results for this route and counts them in `splitToSenderMist`
 - kiosk proceeds go to the sender's address balance, earn no storage rebate, and force the whole batch self-paid. don't charge a fee on proceeds
 - containers: exact supported framework types, explicit zero size, no dynamic fields, owned inputs only
 - Walrus expiry uses Walrus committee time. keep the pinned system/package checks. exclude recognized receipts from generic burn discovery, including live receipts
