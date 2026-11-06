@@ -1,4 +1,4 @@
-export type CleanupActionKind = 'merge_coins' | 'destroy_zero' | 'close_kiosk' | 'burn';
+export type CleanupActionKind = 'merge_coins' | 'keep_tokens' | 'destroy_zero' | 'close_kiosk' | 'burn' | 'empty_container' | 'expired_walrus' | 'withdraw_kiosk' | 'revoke_allowance';
 
 export interface CleanupActionBase {
   kind: CleanupActionKind;
@@ -16,6 +16,8 @@ export interface CleanupActionBase {
   netGainMist: number;
   /** optional label (e.g. coin type for merges, kiosk id for kiosks) */
   label?: string;
+  /** withdrawals don't earn a storage rebate and must pay their own gas */
+  selfPaidOnly?: boolean;
 }
 
 export interface MergeCoinsAction extends CleanupActionBase {
@@ -24,6 +26,17 @@ export interface MergeCoinsAction extends CleanupActionBase {
   label: string;
   /** per-object balance (mist) for display; order matches objectIds */
   objectBalances?: string[];
+  tokenSymbol?: string;
+  tokenDecimals?: number;
+}
+
+export interface KeepTokensAction extends CleanupActionBase {
+  kind: 'keep_tokens';
+  coinType: string;
+  label: string;
+  objectBalances?: string[];
+  tokenSymbol?: string;
+  tokenDecimals?: number;
 }
 
 export interface DestroyZeroAction extends CleanupActionBase {
@@ -51,7 +64,23 @@ export interface BurnAction extends CleanupActionBase {
   label: string;
 }
 
-export type CleanupAction = MergeCoinsAction | DestroyZeroAction | CloseKioskAction | BurnAction;
+export interface ContainerAction extends CleanupActionBase {
+  kind: 'empty_container';
+  objectType: string;
+  moveTarget: string;
+  typeArguments: string[];
+  details: string[];
+}
+
+export interface WithdrawKioskAction extends CleanupActionBase {
+  kind: 'withdraw_kiosk';
+  kioskId: string;
+  ownerCapId: string;
+  proceedsMist: string;
+  details: string[];
+}
+
+export type CleanupAction = MergeCoinsAction | KeepTokensAction | DestroyZeroAction | CloseKioskAction | BurnAction | ContainerAction | WithdrawKioskAction | import('./receiptDiscovery').ReceiptAction;
 
 export interface ScanProgress {
   phase: string;
@@ -60,6 +89,7 @@ export interface ScanProgress {
 }
 
 export interface ScannerState {
+  warnings?: string[];
   loading: boolean;
   error: string | null;
   actions: CleanupAction[];

@@ -1,16 +1,20 @@
 import { motion } from 'framer-motion';
-import { FlaskConical, Trash2 } from 'lucide-react';
+import { FlaskConical, Trash2, Wallet } from 'lucide-react';
 import { Checkbox } from './ui/checkbox';
 import { cn } from '../utils/cn';
+import type { GasMode } from '../sponsoredTx';
+import { kioskProceedsMist } from '../sponsoredTx';
 import { computeFeeMist } from '../buildCleanupTransaction';
 import {
   formatSui,
+  formatTokenBalance,
   shortenAddress,
   shortenAddressesInType,
 } from '../utils/format';
 import type {
   CleanupAction,
   MergeCoinsAction,
+  KeepTokensAction,
   DestroyZeroAction,
   BurnAction,
 } from '../types';
@@ -33,6 +37,7 @@ const itemVariants = {
 
 export function ActionCard({
   action,
+  gasMode = 'sponsored',
   domId,
   selected,
   onToggle,
@@ -48,6 +53,7 @@ export function ActionCard({
   executeBlockedReason = null,
 }: {
   action: CleanupAction;
+  gasMode?: GasMode;
   /** stable id derived from the action's objects, not its position in the list */
   domId: string;
   selected: boolean;
@@ -65,10 +71,11 @@ export function ActionCard({
   /** why this can't run right now (unsponsorable, or no SUI for self-paid gas); null if it can */
   executeBlockedReason?: string | null;
 }) {
-  const isDestructive = action.kind === 'burn' || action.kind === 'close_kiosk';
+  if (action.selfPaidOnly || action.kind === 'withdraw_kiosk') gasMode = 'self';
+  const isDestructive = action.kind === 'burn' || action.kind === 'close_kiosk' || action.kind === 'revoke_allowance' || action.kind === 'empty_container' || action.kind === 'expired_walrus';
   const isDiscovered = action.kind === 'burn' && (action as BurnAction).discovered;
-  const isCoin = action.kind === 'merge_coins' || action.kind === 'destroy_zero';
-  const coinType = isCoin ? (action as MergeCoinsAction | DestroyZeroAction).coinType : '';
+  const isCoin = action.kind === 'merge_coins' || action.kind === 'destroy_zero' || action.kind === 'keep_tokens';
+  const coinType = isCoin ? (action as MergeCoinsAction | KeepTokensAction | DestroyZeroAction).coinType : '';
   const coinTypeArg = coinType.includes('<') ? coinType.slice(coinType.indexOf('<') + 1, -1) : '';
   const coinParensText = coinTypeArg ? `COIN<${shortenAddressesInType(coinTypeArg, shortenAddress)}>` : '';
   const coinLinkHref = coinTypeArg ? `${SUIVISION_COIN_URL}/${coinTypeArg}` : null;
@@ -129,13 +136,13 @@ export function ActionCard({
           )}
 
           <div className="w-full mt-2 ml-9 space-y-1 text-[10px] font-bold uppercase tracking-wider text-skitty-secondary/60">
-            {action.kind === 'merge_coins' && (
+            {(action.kind === 'merge_coins' || action.kind === 'keep_tokens') && (
               <div className="space-y-1">
-                {(action as MergeCoinsAction).objectIds.map((id, i) => {
-                  const balanceMist = (action as MergeCoinsAction).objectBalances?.[i];
-                  const balanceStr = balanceMist != null ? formatSui(Number(balanceMist)) : '-';
+                {action.objectIds.map((id, i) => {
+                  const raw = action.objectBalances?.[i];
+                  const balanceStr = raw != null ? formatTokenBalance(raw, action.tokenDecimals, action.tokenSymbol) : 'unknown';
                   return (
-                    <div key={id} className="flex gap-4 items-center">
+                    <div key={id} className="flex flex-wrap gap-x-4 gap-y-1 items-center">
                       <a
                         href={`${SUIVISION_OBJECT_URL}/${id}`}
                         target="_blank"
@@ -145,10 +152,22 @@ export function ActionCard({
                       >
                         {shortenAddress(id)}
                       </a>
-                      <span className="text-[10px]">BALANCE: {balanceStr} SUI</span>
+                      <span className="text-[10px] break-all">balance: {balanceStr}</span>
                     </div>
                   );
                 })}
+              </div>
+            )}
+            {'details' in action && (
+              <div className="space-y-2 normal-case">
+                {action.details.map((detail, index) => <p key={index} className="break-all">{detail}</p>)}
+                {gasMode === 'self' && <p className="text-amber-400">this action needs SUI in your wallet for gas</p>}
+                {action.kind === 'withdraw_kiosk' && <p>observed proceeds: {formatSui(Number(action.proceedsMist))} SUI. storage rebate: {formatSui(action.userRebateMist)} SUI.</p>}
+                {'objectType' in action && <p className="break-all">{action.objectType}</p>}
+                {'moveTarget' in action && <p className="break-all">call: {action.moveTarget}{'typeArguments' in action ? ' ' + action.typeArguments.join(', ') : ''}</p>}
+                {[...new Set([...action.objectIds, ...('callObjectIds' in action ? action.callObjectIds : []), ...('kioskId' in action ? [action.kioskId, action.ownerCapId] : [])])].map((id) => (
+                  <a key={id} href={SUIVISION_OBJECT_URL + '/' + id} target="_blank" rel="noopener noreferrer" className="block break-all text-skitty-accent underline">{id}</a>
+                ))}
               </div>
             )}
             {(action.kind === 'destroy_zero' || action.kind === 'close_kiosk' || action.kind === 'burn') && (
@@ -190,12 +209,13 @@ export function ActionCard({
                 const valueMist =
                   simulatedNetInflowMist !== undefined
                     ? simulatedNetInflowMist
-                    : Math.max(0, action.userRebateMist - computeFeeMist(Number(action.storageRebateTotal)) - action.estimatedGasMist);
+                    : kioskProceedsMist([action]) + action.userRebateMist - computeFeeMist(Number(action.storageRebateTotal)) - action.estimatedGasMist;
                 return (valueMist >= 0 ? '+' : '') + formatSui(valueMist);
               })()}
             </p>
           </div>
 
+          {executeBlockedReason && <p className="text-[10px] text-amber-400 max-w-[12rem]">{executeBlockedReason}</p>}
           {(interactive || showSimulate) && (
             <div className="flex items-center gap-1.5 pt-1">
               <button
@@ -204,7 +224,7 @@ export function ActionCard({
                   e.stopPropagation();
                   onDryRun();
                 }}
-                disabled={simulating}
+                disabled={simulating || Boolean(executeBlockedReason && action.selfPaidOnly)}
                 className="p-1.5 bg-black border border-white/10 hover:border-skitty-accent hover:text-skitty-accent transition-all group/btn shadow-[2px_2px_0_#000] disabled:opacity-20"
                 title="RUN SIMULATION"
                 aria-label={`Simulate ${shortLabel}`}
@@ -214,6 +234,14 @@ export function ActionCard({
               {interactive && (() => {
                 const label = executeBlockedReason
                   ? executeBlockedReason
+                  : action.kind === 'withdraw_kiosk'
+                    ? 'review kiosk proceeds withdrawal'
+                  : action.kind === 'revoke_allowance'
+                    ? 'review revocation of spending access'
+                  : action.kind === 'empty_container' || action.kind === 'expired_walrus'
+                    ? 'review permanent deletion'
+                  : action.kind === 'keep_tokens'
+                    ? `Keep tokens in my address balance: ${shortLabel}`
                   : action.kind === 'merge_coins'
                     ? `Merge coins ${shortLabel}`
                     : action.kind === 'destroy_zero'
@@ -238,7 +266,7 @@ export function ActionCard({
                     title={label}
                     aria-label={label}
                   >
-                    <Trash2 className="h-3.5 w-3.5" />
+                    {action.kind === 'keep_tokens' ? <Wallet className="h-3.5 w-3.5" /> : <Trash2 className="h-3.5 w-3.5" />}
                   </button>
                 );
               })()}

@@ -3,7 +3,6 @@ import { graphQLClient } from './graphql/client';
 import {
   REBATE_MULTIPLIER,
   ESTIMATED_GAS,
-  MAX_MERGES_PER_BATCH,
   isProtectedType,
   isSameMoveType,
   normalizeTypeAddress,
@@ -11,21 +10,23 @@ import {
 import { computeFeeMist } from './buildCleanupTransaction';
 import type {
   CleanupAction,
-  MergeCoinsAction,
-  DestroyZeroAction,
   CloseKioskAction,
+  WithdrawKioskAction,
   BurnAction,
   ScannerState,
   ScanProgress,
 } from './types';
-import { KNOWN_BURNABLE, SUI_COIN_TYPE_ARG, SUI_COIN_TYPE_ARG_LONG } from './constants';
+import { KNOWN_BURNABLE } from './constants';
 import {
   getCoinTypeArg,
   getWalletCoinBlocklist,
   getWalletObjectBlocklist,
   isObjectTypeBlockedIn,
 } from './walletBlocklist';
-import { actionKey } from './actionIdentity';
+import { generateCoinActions, parseCoinBalance, totalUniqueUserRebateMist } from './coinActions';
+import type { CoinMetadata } from './coinActions';
+import { discoverContainers, containerType } from './containerDiscovery';
+import { discoverReceipts, isReceiptType } from './receiptDiscovery';
 
 const COIN_TYPE_PREFIX = '0x2::coin::coin<';
 
@@ -77,6 +78,8 @@ export function useGraphQLScanner(address: string | null) {
       scanProgress: { phase: 'starting', current: 0, total: 1 },
       error: null,
       actions: [],
+      warnings: [],
+      totalUserRebateMist: 0,
       scannedAddress: address,
     }));
 
@@ -92,6 +95,26 @@ export function useGraphQLScanner(address: string | null) {
       updateProgress({ phase: 'fetching kiosks', current: 0, total: 1 });
       const kioskResult = await findEmptyKiosksByGraphQL(address, updateProgress);
 
+      updateProgress({ phase: 'checking containers and receipts', current: 0, total: 1 });
+      let discoveryPages = 0;
+      const discoveryProgress = () => {
+        discoveryPages += 1;
+        updateProgress({phase:'checking containers and receipts',current:discoveryPages,total:discoveryPages+1});
+      };
+      const extraResults = await Promise.allSettled([
+        discoverContainers(graphQLClient, address, discoveryProgress), discoverReceipts(graphQLClient, address, discoveryProgress),
+      ]);
+      const warnings: string[] = [];
+      const extraActions: CleanupAction[] = [];
+      for (const [index, result] of extraResults.entries()) {
+        if (result.status === 'rejected') {
+          warnings.push(`${index === 0 ? 'container' : 'Walrus and allowance'} scan incomplete: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+        } else if (Array.isArray(result.value)) extraActions.push(...result.value);
+        else { extraActions.push(...result.value.actions); warnings.push(...result.value.warnings); }
+      }
+      const objectBlocklist = await getWalletObjectBlocklist();
+      const allowedExtras = extraActions.filter(action => !('objectType' in action) || !isObjectTypeBlockedIn(objectBlocklist, action.objectType));
+
       updateProgress({ phase: 'fetching NFTs', current: 0, total: 1 });
       const burnableResult = await findBurnableObjects(address, updateProgress);
 
@@ -101,14 +124,16 @@ export function useGraphQLScanner(address: string | null) {
         ...coinResults,
         ...kioskResult,
         ...burnableResult,
+        ...allowedExtras,
       ];
-      const totalUserRebateMist = actions.reduce((s, a) => s + a.userRebateMist, 0);
+      const totalUserRebateMist = totalUniqueUserRebateMist(actions);
 
       setState(prev => ({
         ...prev,
         loading: false,
         scanProgress: null,
         actions,
+        warnings,
         totalUserRebateMist,
         scannedAddress: address,
       }));
@@ -119,6 +144,7 @@ export function useGraphQLScanner(address: string | null) {
         loading: false,
         scanProgress: null,
         actions: [],
+        totalUserRebateMist: 0,
         error: error instanceof Error ? error.message : String(error),
       }));
     }
@@ -126,37 +152,8 @@ export function useGraphQLScanner(address: string | null) {
 
   const refreshAfterExecute = React.useCallback(async (executedActions: CleanupAction[]) => {
     if (executedActions.length === 0) return;
-    const allIds = [...new Set(executedActions.flatMap((a) => a.objectIds))];
-    if (allIds.length === 0) return;
-    try {
-      const { objects } = await graphQLClient.getObjects({ objectIds: allIds });
-      const existingIds = new Set<string>();
-      objects.forEach((obj, i) => {
-        // a deleted object comes back as an Error entry rather than throwing
-        if (!(obj instanceof Error) && obj?.objectId && allIds[i]) existingIds.add(allIds[i]);
-      });
-      const keysToRemove = new Set<string>();
-      for (const a of executedActions) {
-        const remaining = a.objectIds.filter((id) => existingIds.has(id));
-        // a merge keeps its primary coin alive by design, so "every id gone" never
-        // holds for it - an action is spent once it can no longer be performed
-        const spent = a.kind === 'merge_coins' ? remaining.length <= 1 : remaining.length === 0;
-        if (spent) keysToRemove.add(actionKey(a));
-      }
-      if (keysToRemove.size === 0) return;
-      setState((prev) => {
-        const nextActions = prev.actions.filter((a) => !keysToRemove.has(actionKey(a)));
-        const totalUserRebateMist = nextActions.reduce((s, x) => s + x.userRebateMist, 0);
-        return {
-          ...prev,
-          actions: nextActions,
-          totalUserRebateMist,
-        };
-      });
-    } catch {
-      // refresh after execute failed; state unchanged
-    }
-  }, []);
+    await scan();
+  }, [scan]);
 
   React.useEffect(() => {
     // abandon any in-flight scan for the previous address
@@ -169,31 +166,11 @@ export function useGraphQLScanner(address: string | null) {
       actions: [],
       totalUserRebateMist: 0,
       scannedAddress: null,
+      warnings: [],
     }));
   }, [address]);
 
   return { state, scan, refreshAfterExecute };
-}
-
-// get coin balance from GraphQL contents.json (balance string or { value: string }); return 0n only when explicitly 0, else 1n so we don't destroy coins by mistake
-function getCoinBalanceFromJson(json: unknown): bigint {
-  if (json == null || typeof json !== 'object') return 1n;
-  const balance = (json as Record<string, unknown>)['balance'];
-  if (balance === undefined || balance === null) return 1n;
-  let value: string | undefined;
-  if (typeof balance === 'object' && balance !== null && 'value' in balance) {
-    value = (balance as { value?: string }).value;
-  } else if (typeof balance === 'string') {
-    value = balance;
-  } else {
-    return 1n;
-  }
-  if (value === undefined || value === null) return 1n;
-  try {
-    return BigInt(value);
-  } catch {
-    return 1n;
-  }
 }
 
 // find mergeable coins and zero-balance (destroy_zero) via GraphQL; returns both as CleanupAction[]
@@ -251,90 +228,29 @@ async function findCoinActionsByGraphQL(
     }
     updateProgress({ phase: 'analyzing coins', current: 0, total: coins.length });
 
-    const coinsByType = new Map<string, { objectIds: string[]; balances: string[]; rebates: string[]; storageRebateTotal: number }>();
-    const zeroBalanceCoins: { address: string; coinType: string; storageRebate: number }[] = [];
-    let current = 0;
-
-    for (const coin of coins) {
-      current++;
-      if (current % 10 === 0) {
-        updateProgress({ phase: 'analyzing coins', current, total: coins.length });
-      }
-      const coinType = coin.contents?.type?.repr;
-      if (!coinType) continue;
-      const storageRebate = Number(coin.storageRebate ?? 0);
-      const balance = getCoinBalanceFromJson(coin.contents?.json);
-      if (balance === 0n) {
-        zeroBalanceCoins.push({ address: coin.address, coinType, storageRebate });
-      } else {
-        const group = coinsByType.get(coinType) ?? { objectIds: [], balances: [], rebates: [], storageRebateTotal: 0 };
-        group.objectIds.push(coin.address);
-        group.balances.push(String(balance));
-        group.rebates.push(String(storageRebate));
-        group.storageRebateTotal += storageRebate;
-        coinsByType.set(coinType, group);
-      }
-    }
-
     const blocklist = await getWalletCoinBlocklist();
-
-    const mergeActions: MergeCoinsAction[] = [];
-    const estMerge = ESTIMATED_GAS.mergeCoins;
-    for (const [coinType, group] of coinsByType.entries()) {
-      if (group.objectIds.length <= 1) continue;
-      const typeArg = getCoinTypeArg(coinType);
-      if (blocklist.has(typeArg)) continue;
-      if (typeArg === SUI_COIN_TYPE_ARG || typeArg === SUI_COIN_TYPE_ARG_LONG) continue;
-      // merging N coins destroys N-1: the first coin survives as the merge target and
-      // its rebate is never reclaimed, and anything past MAX_MERGES_PER_BATCH is left
-      // for a later run. Quoting the full sum would overstate what the user gets back
-      // and, in sponsored mode, overdraw the sponsor.
-      const mergedIds = group.objectIds.slice(0, MAX_MERGES_PER_BATCH);
-      const realizedRebate = group.rebates
-        .slice(1, mergedIds.length)
-        .reduce((sum, r) => sum + Number(r), 0);
-      const userRebateMist = Math.floor(realizedRebate * REBATE_MULTIPLIER);
-      const feeMist = computeFeeMist(realizedRebate);
-      if (userRebateMist < estMerge + feeMist) continue;
-      const label = typeArg.indexOf('::') !== -1 ? typeArg.slice(typeArg.indexOf('::') + 2) : typeArg;
-      mergeActions.push({
-        kind: 'merge_coins',
-        coinType,
-        label,
-        objectIds: mergedIds,
-        objectBalances: group.balances.slice(0, mergedIds.length),
-        objectStorageRebates: group.rebates.slice(0, mergedIds.length),
-        storageRebateTotal: String(realizedRebate),
-        userRebateMist,
-        estimatedGasMist: estMerge,
-        netGainMist: userRebateMist - estMerge - feeMist,
-      });
+    const metadata = new Map<string, CoinMetadata>();
+    const blocked = new Set([...blocklist].map(normalizeTypeAddress));
+    const types = new Set(coins.filter(coin => {
+      const balance = parseCoinBalance(coin.contents?.json);
+      return balance !== null && balance > 0n;
+    }).map(coin => coin.contents?.type?.repr).filter((type): type is string => !!type));
+    // sequential requests keep large wallets from flooding the metadata endpoint.
+    for (const coinType of types) {
+      const inner = getCoinTypeArg(coinType);
+      if (blocked.has(normalizeTypeAddress(inner)) || isSameMoveType(inner, '0x2::sui::SUI')) continue;
+      try {
+        const { coinMetadata } = await graphQLClient.getCoinMetadata({ coinType: inner });
+        if (coinMetadata) metadata.set(coinType, {
+          ...(typeof coinMetadata.symbol === 'string' && coinMetadata.symbol ? { tokenSymbol: coinMetadata.symbol } : {}),
+          ...(Number.isInteger(coinMetadata.decimals) && coinMetadata.decimals >= 0 && coinMetadata.decimals <= 255
+            ? { tokenDecimals: coinMetadata.decimals } : {}),
+        });
+      } catch {
+        // display metadata is optional; retain raw balances when unavailable.
+      }
     }
-
-    const destroyZeroActions: DestroyZeroAction[] = [];
-    const estZero = ESTIMATED_GAS.destroyZero;
-    for (const z of zeroBalanceCoins) {
-      const typeArg = getCoinTypeArg(z.coinType);
-      if (blocklist.has(typeArg)) continue;
-      if (typeArg === SUI_COIN_TYPE_ARG || typeArg === SUI_COIN_TYPE_ARG_LONG) continue;
-      const userRebateMist = Math.floor(z.storageRebate * REBATE_MULTIPLIER);
-      const feeMist = computeFeeMist(z.storageRebate);
-      if (userRebateMist < estZero + feeMist) continue;
-      const label = typeArg.indexOf('::') !== -1 ? typeArg.slice(typeArg.indexOf('::') + 2) : typeArg;
-      destroyZeroActions.push({
-        kind: 'destroy_zero',
-        coinType: z.coinType,
-        objectIds: [z.address],
-        objectStorageRebates: [String(z.storageRebate)],
-        storageRebateTotal: String(z.storageRebate),
-        userRebateMist,
-        estimatedGasMist: estZero,
-        netGainMist: userRebateMist - estZero - feeMist,
-        label,
-      });
-    }
-
-    return [...mergeActions, ...destroyZeroActions];
+    return generateCoinActions(coins, blocklist, metadata);
   }
 }
 
@@ -342,7 +258,7 @@ async function findCoinActionsByGraphQL(
 async function findEmptyKiosksByGraphQL(
   address: string,
   updateProgress: (progress: ScanProgress) => void
-): Promise<CloseKioskAction[]> {
+): Promise<(CloseKioskAction | WithdrawKioskAction)[]> {
   updateProgress({ phase: 'fetching kiosk caps', current: 0, total: 1 });
 
   type KioskCapNode = { address: string; storageRebate?: string | number; contents?: { json?: { for?: string } } };
@@ -395,7 +311,7 @@ async function findEmptyKiosksByGraphQL(
 
   updateProgress({ phase: 'checking kiosks', current: 0, total: kioskCaps.length });
   const est = ESTIMATED_GAS.closeKiosk;
-  const closeActions: CloseKioskAction[] = [];
+  const closeActions: (CloseKioskAction | WithdrawKioskAction)[] = [];
   const objectBlocklist = await getWalletObjectBlocklist();
   if (isObjectTypeBlockedIn(objectBlocklist, KIOSK_TYPE)) return closeActions;
   let current = 0;
@@ -407,7 +323,15 @@ async function findEmptyKiosksByGraphQL(
     const kioskId = json?.for ?? null;
     if (!kioskId) continue;
     const kiosk = await inspectKiosk(kioskId);
-    if (!kiosk || !kiosk.empty) continue;
+    if (!kiosk) continue;
+    if (BigInt(kiosk.profitsRaw) > 0n) {
+      closeActions.push({kind:'withdraw_kiosk',kioskId,ownerCapId:cap.address,
+        proceedsMist:kiosk.profitsRaw,selfPaidOnly:true,label:kioskId,
+        objectIds:[kioskId,cap.address],storageRebateTotal:'0',objectStorageRebates:['0','0'],
+        userRebateMist:0,estimatedGasMist:2_000_000,netGainMist:Number(kiosk.profitsRaw)-2_000_000,
+        details:[`sale proceeds: ${kiosk.profitsRaw} mist`, 'kiosk and owner capability stay open']});
+    }
+    if (!kiosk.empty) continue;
     // closing deletes BOTH the kiosk and its owner cap, so both rebates come back
     const capRebate = Number(cap.storageRebate ?? 0);
     const storageRebateTotal = capRebate + kiosk.storageRebateMist;
@@ -419,8 +343,8 @@ async function findEmptyKiosksByGraphQL(
       kioskId,
       ownerCapId: cap.address,
       label: kioskId,
-      objectIds: [kioskId],
-      objectStorageRebates: [String(storageRebateTotal)],
+      objectIds: [kioskId, cap.address],
+      objectStorageRebates: [String(kiosk.storageRebateMist), String(capRebate)],
       storageRebateTotal: String(storageRebateTotal),
       profitsMist: kiosk.profitsMist,
       userRebateMist,
@@ -438,7 +362,7 @@ async function findEmptyKiosksByGraphQL(
  */
 async function inspectKiosk(
   kioskId: string
-): Promise<{ empty: boolean; storageRebateMist: number; profitsMist: number } | null> {
+): Promise<{ empty: boolean; storageRebateMist: number; profitsMist: number; profitsRaw: string } | null> {
   try {
     const { data } = await runQuery({
       query: `
@@ -464,25 +388,30 @@ async function inspectKiosk(
     const object = (data as KioskObject)?.object;
     const fields = object?.asMoveObject?.contents?.json;
     if (!fields) return null;
-    const itemCount = Number(fields.item_count ?? 0);
+    const itemCount = Number(fields.item_count ?? NaN);
     if (!Number.isFinite(itemCount)) return null;
     // item_count only covers items. Kiosk extensions live as dynamic fields on the
     // kiosk's UID and never touch it, and close_and_withdraw deletes the UID outright - // orphaning that extension's storage. Require the kiosk to be empty both ways.
-    const dynamicFieldCount = (data as KioskObject)?.address?.dynamicFields?.nodes?.length ?? 0;
+    const dynamicFieldCount = (data as KioskObject)?.address?.dynamicFields?.nodes?.length ?? NaN;
     // profits is a Balance<SUI>, which serializes either as a bare u64 string or as { value }
     const profits = fields.profits;
-    const profitsMist = Number(
+    const profitsValue = (
       typeof profits === 'object' && profits !== null
         ? (profits as { value?: string }).value ?? 0
         : profits ?? 0
     );
+    if (typeof profitsValue === 'number' && !Number.isSafeInteger(profitsValue)) return null;
+    const profitsRaw = String(profitsValue);
+    if (!/^\d+$/.test(profitsRaw) || BigInt(profitsRaw) > 18446744073709551615n) return null;
+    const profitsMist = Number(profitsRaw);
     return {
       empty: itemCount === 0 && dynamicFieldCount === 0,
       storageRebateMist: Number(object?.storageRebate ?? 0),
       profitsMist: Number.isFinite(profitsMist) ? profitsMist : 0,
+      profitsRaw,
     };
-  } catch {
-    return null;
+  } catch (error) {
+    throw new Error(`Could not inspect kiosk ${kioskId}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -659,6 +588,7 @@ async function findBurnableObjects(
         normalizeTypeAddress(type).startsWith(COIN_TYPE_PREFIX) ||
         isSameMoveType(type, KIOSK_TYPE) ||
         isSameMoveType(type, KIOSK_OWNER_CAP_TYPE)
+        || containerType(type) !== null || isReceiptType(type)
       )
         continue;
       if (isProtectedType(type)) continue;

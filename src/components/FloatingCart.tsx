@@ -1,6 +1,7 @@
 import { motion, AnimatePresence } from 'framer-motion';
 import { Trash2, ChevronDown, ChevronUp, PartyPopper } from 'lucide-react';
 import { Button } from './ui/button';
+import { kioskProceedsMist } from '../sponsoredTx';
 import { computeFeeMist } from '../buildCleanupTransaction';
 import { formatSui, shortLabelFromType } from '../utils/format';
 import { actionKey } from '../actionIdentity';
@@ -14,6 +15,7 @@ export function FloatingCart({
   feeMist,
   estimatedGasMist,
   userShareMist,
+  proceedsMist = 0,
   droppedActionCount = 0,
   dryRunResult,
   executeError,
@@ -40,6 +42,7 @@ export function FloatingCart({
   estimatedGasMist: number;
   /** SUI the user ends up with after fee and gas; negative when the batch costs more than it returns */
   userShareMist: number;
+  proceedsMist?: number;
   /** actions the batch cap left out of this transaction */
   droppedActionCount?: number;
   dryRunResult: { netGainMist: number; gasCostMist: number; error?: string } | null;
@@ -61,6 +64,8 @@ export function FloatingCart({
   isMinimized: boolean;
   onToggleMinimize: () => void;
 }) {
+  const forcedSelf = selectedActionList.some((a) => a.selfPaidOnly || a.kind === 'withdraw_kiosk');
+  if (forcedSelf) gasMode = 'self';
   return (
     <div className="relative pointer-events-auto w-full max-w-lg">
       <AnimatePresence mode="wait">
@@ -111,9 +116,10 @@ export function FloatingCart({
                   className="text-[10px] font-black uppercase tracking-widest text-skitty-secondary flex justify-between gap-4 py-1 border-b border-white/5"
                 >
                   <span className="truncate max-w-[200px]" title={action.label ?? action.objectIds[0]}>
+                    {action.kind === 'keep_tokens' ? 'keep tokens: ' : action.kind === 'merge_coins' ? 'merge: ' : ''}
                     {shortLabelFromType(action.label ?? action.objectIds[0] ?? '')}
                   </span>
-                  <span className="shrink-0 text-white">+{formatSui(Math.max(0, action.userRebateMist - computeFeeMist(Number(action.storageRebateTotal)) - action.estimatedGasMist))} SUI</span>
+                  <span className="shrink-0 text-white">{formatSui(kioskProceedsMist([action]) + action.userRebateMist - computeFeeMist(Number(action.storageRebateTotal)) - action.estimatedGasMist)} SUI</span>
                 </motion.div>
               ))}
             </div>
@@ -133,7 +139,7 @@ export function FloatingCart({
                     </p>
                     {gasMode === 'self' && (
                       <p className="text-[10px] font-black text-amber-400 uppercase tracking-widest leading-snug mt-2 max-w-[14rem]">
-                        Sponsor unavailable: your wallet pays gas
+                        {forcedSelf ? 'this action needs SUI in your wallet for gas' : 'sponsor unavailable: your wallet pays gas'}
                       </p>
                     )}
                   </div>
@@ -142,6 +148,7 @@ export function FloatingCart({
                       <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">Storage rebate</p>
                       <p className="text-xs font-black text-white tracking-tighter">{formatSui(storageRebateMist)} SUI</p>
                     </div>
+                    {proceedsMist > 0 && <div><p className="text-[10px] text-skitty-secondary">kiosk proceeds (no fee)</p><p className="text-xs text-white">{formatSui(proceedsMist)} SUI</p></div>}
                     <div>
                       <p className="text-[10px] font-black text-red-500 uppercase tracking-widest">Protocol burn (1%)</p>
                       <p className="text-xs font-black text-red-500/80 tracking-tighter">-{formatSui(burnedMist)} SUI</p>
@@ -250,7 +257,7 @@ export function FloatingCart({
                   <Button
                     variant="outline"
                     onClick={runDryRun}
-                    disabled={simulating}
+                    disabled={simulating || Boolean(forcedSelf && executeBlockedReason)}
                     className="flex-1 h-14"
                   >
                     {simulating ? 'SIMULATING...' : 'SIMULATE'}

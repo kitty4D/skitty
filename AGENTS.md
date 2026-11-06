@@ -1,28 +1,35 @@
 # agents
 
-sui storage-rebate reclaimer. vite + react + ts frontend, vercel functions in `api/`. mainnet only.
+skitty reclaims Sui object storage. mainnet only. Vite + React + TypeScript, Vercel handlers in `api/`
 
-read `docs/memory/MEMORY.md` before touching gas, sponsorship, or the sui client. `.cursorrules` (local, untracked) predates the graphql migration; where it disagrees with this, it's wrong.
+read [project memory](docs/memory/MEMORY.md) before changing gas, sponsorship, discovery, or the Sui client. code is the source of truth. update memory when it disagrees. local `.cursorrules` predates the GraphQL migration
 
 ## commands
 
-- `npm test` (vitest: `src/**/*.test.ts` + `tests/*.test.mjs`)
-- `npx tsc --noEmit -p .` / `npm run lint` / `npm run build`
-- dev server: launch config `skitty-dev` (port 5199). plain vite serves `api/*.js` as source, so the sponsor looks offline and the app runs self-paid.
+- `npm test`
+- `npx tsc --noEmit -p .`
+- `npm run lint`
+- `npm run build`
+- `npm run dev`: frontend only, self-paid fallback without the API
+- launch config `skitty-dev` uses port 5199. use `vercel dev` for handlers too
 
-## hard rules
+## boundaries
 
-- sui json-rpc is dead on public fullnodes. everything goes through `SuiGraphQLClient` (`src/graphql/client.ts`).
-- `lib/sponsorPolicy.js` is the fund-safety boundary. any change needs a drain-shape test in `tests/sponsorPolicy.test.mjs`.
-- sponsor gas comes from a `Coin<SUI>` object only. never reintroduce address-balance gas for the sponsor. its address balance gets converted into a coin automatically (`lib/sponsorGasCoin.js`, called from `api/sponsor.js`).
-- every file in `api/` is deployed as its own endpoint. `api/` holds only the handlers (`sponsor.js`, `explain.js`); anything they import goes in `lib/`.
-- self-paid address-balance route must never reference `tx.gas`. fee goes through `tx.withdrawal`.
-- self-paid fees go to `FEE_RECIPIENT` via `send_funds`, never as a new coin object (storage cost lands on the user).
-- `FEE_RECIPIENT` in `src/constants.ts` must equal the address of `SUI_SPONSOR_PRIV`.
-- `simulateTransaction` with an empty gas payment does NOT check the payer. never treat that simulation as proof anyone can pay.
-- never read `.env*` files. `SUI_SPONSOR_PRIV` is a hot key.
-- no commits, branches or pushes without asking.
+- use the shared `SuiGraphQLClient` in `src/graphql/client.ts`. don't restore public-fullnode JSON-RPC
+- `api/` contains only `sponsor.js` and `explain.js`. shared server code belongs in `lib/`, otherwise Vercel deploys it as an endpoint
+- `lib/sponsorPolicy.js` decides what the hot key signs. policy changes need attack-shape tests in `tests/sponsorPolicy.test.mjs`. keep the gas-coin arithmetic and sponsor balance gates
+- user cleanup sponsorship uses a real sponsor-owned `Coin<SUI>`. automatic conversion is a separate sponsor-sent transaction and can use its address balance
+- `FEE_RECIPIENT` must match the sponsor key's address. never read `.env*` or expose `SUI_SPONSOR_PRIV`
+- empty-payment simulation doesn't prove the payer can afford gas. self-paid planning checks holdings separately
+- self-paid address-balance transactions never reference `tx.gas`. fees use withdrawal/redeem/send. coin-paid fees use `coin::send_funds`, avoiding a new fee coin
+- keep-token deposits go only to the sender's address balance. exclude all gas-payment coins. overlapping actions can't share inputs. coin-paid SUI consolidation uses the gas coin
+- kiosk proceeds go to the sender's address balance, earn no storage rebate, and force the whole batch self-paid. don't charge a fee on proceeds
+- containers: exact supported framework types, explicit zero size, no dynamic fields, owned inputs only
+- Walrus expiry uses Walrus committee time. keep the pinned system/package checks. exclude recognized receipts from generic burn discovery, including live receipts
+- allowance review covers native Sui caps only. revoke uses owned cap first, matching allowance second. don't call this a review of every protocol permission
+- show incomplete discovery as a warning. require confirmation for object cleanup. wallet changes clear feedback and pending confirmations
+- no commits, branches, pushes, deployments, or signed onchain actions without explicit authorization. this docs update isn't commit permission
 
-## style
+## docs and voice
 
-no emoji, no em or en dashes in anything committed. comments lowercase, explain why. README is public and professional.
+keep README, this file, and `docs/memory/` aligned with implemented behavior. `CLAUDE.md` imports this file, so don't duplicate rules there

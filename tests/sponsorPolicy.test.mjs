@@ -21,6 +21,14 @@ const DIGEST = '11111111111111111111111111111111';
 
 const ref = (id) => ({ objectId: id, version: '1', digest: DIGEST });
 
+test('Walrus receipt burns use the existing pinned-owned burn policy', async () => {
+  const target = '0xa9ac4281c72b0ed3277c08e821ab77eccea7b187f2b402ffa3b33f548d4bbf1e::blob::burn';
+  const data = await dataFor(tx => tx.moveCall({target,arguments:[tx.objectRef(ref(OBJ_A))]}));
+  expect(check(data)).toEqual({totalSplitFromGas:0n,splitToSenderMist:0n});
+  data.inputs[0].Object = {$kind:'SharedObject',SharedObject:{objectId:OBJ_A,initialSharedVersion:'1',mutable:true}};
+  expect(()=>check(data)).toThrow(/owned, version-pinned/);
+});
+
 async function dataFor(build) {
   const tx = new Transaction();
   build(tx);
@@ -30,6 +38,225 @@ async function dataFor(build) {
 
 const check = (data, sender = USER) =>
   validateReclaimTransactionKind(data, { sender, feeRecipient: SPONSOR });
+
+const containers = [['bag', 0], ['object_bag', 0], ['table', 2], ['object_table', 2]];
+const cleanupData = (module, count) => dataFor((tx) => {
+  tx.moveCall({
+    target: `0x2::${module}::destroy_empty`,
+    typeArguments: Array(count).fill('u64'),
+    arguments: [tx.objectRef(ref(OBJ_A))],
+  });
+});
+const revokeData = (shared = true) => dataFor((tx) => {
+  tx.moveCall({
+    target: '0x2::allowance::revoke',
+    typeArguments: ['0x2::balance::Balance<0x2::sui::SUI>'],
+    arguments: [tx.objectRef(ref(OBJ_A)), shared
+      ? tx.sharedObjectRef({ objectId: OBJ_B, initialSharedVersion: '1', mutable: true })
+      : tx.objectRef(ref(OBJ_B))],
+  });
+});
+const unsafeRefs = [
+  { $kind: 'GasCoin', GasCoin: true },
+  { $kind: 'Result', Result: 0 },
+  { $kind: 'NestedResult', NestedResult: [0, 0] },
+  { $kind: 'Input', Input: 99 },
+];
+
+test.each(containers)('accepts owned %s cleanup with %i type arguments', async (module, count) => {
+  expect(check(await cleanupData(module, count))).toEqual({ totalSplitFromGas: 0n, splitToSenderMist: 0n });
+});
+
+test.each(containers)('rejects malformed and drain-shaped %s cleanup', async (module, count) => {
+  for (const types of [Array(count + 1).fill('u64'), ...(count ? [[], ['u64']] : [])]) {
+    const data = await cleanupData(module, count);
+    data.commands[0].MoveCall.typeArguments = types;
+    expect(() => check(data)).toThrow(/type arguments/);
+  }
+  for (const arg of unsafeRefs) {
+    const data = await cleanupData(module, count);
+    data.commands[0].MoveCall.arguments = [arg];
+    expect(() => check(data)).toThrow(/gas coin|owned, version-pinned/);
+  }
+  for (const length of [0, 2]) {
+    const data = await cleanupData(module, count);
+    data.commands[0].MoveCall.arguments = Array(length).fill({ $kind: 'Input', Input: 0 });
+    expect(() => check(data)).toThrow(/exactly 1 argument/);
+  }
+  for (const kind of ['SharedObject', 'Receiving']) {
+    const data = await cleanupData(module, count);
+    data.inputs[0].Object = { $kind: kind, [kind]: ref(OBJ_A) };
+    expect(() => check(data)).toThrow(/owned, version-pinned|receiving inputs/);
+  }
+});
+
+test.each([true, false])('accepts revoke with shared allowance %s', async (shared) => {
+  expect(check(await revokeData(shared))).toEqual({ totalSplitFromGas: 0n, splitToSenderMist: 0n });
+});
+
+test.each(['bag', 'object_bag', 'table', 'object_table'])(
+  'rejects pure %s containers and framework target lookalikes', async (module) => {
+    const count = module.includes('table') ? 2 : 0;
+    const pure = await cleanupData(module, count);
+    pure.inputs[0] = { $kind: 'Pure', Pure: { bytes: '' } };
+    expect(() => check(pure)).toThrow(/owned, version-pinned/);
+    const lookalike = await cleanupData(module, count);
+    lookalike.commands[0].MoveCall.package = '0x3';
+    expect(() => check(lookalike)).toThrow(/not an allowed framework call/);
+  }
+);
+
+test('keeps kiosk withdraw outside the allowlist', async () => {
+  const data = await revokeData();
+  data.commands[0].MoveCall.module = 'kiosk';
+  data.commands[0].MoveCall.function = 'withdraw';
+  expect(() => check(data)).toThrow(/not an allowed framework call/);
+});
+
+test('rejects malformed revoke arity and unsafe cap or allowance references', async () => {
+  for (const types of [[], ['u64', 'u64']]) {
+    const data = await revokeData();
+    data.commands[0].MoveCall.typeArguments = types;
+    expect(() => check(data)).toThrow(/exactly 1 type argument/);
+  }
+  for (const length of [0, 1, 3]) {
+    const data = await revokeData();
+    data.commands[0].MoveCall.arguments = Array(length).fill({ $kind: 'Input', Input: 0 });
+    expect(() => check(data)).toThrow(/exactly 2 arguments/);
+  }
+  for (const slot of [0, 1]) {
+    for (const arg of [...unsafeRefs, { $kind: 'Input', Input: 2 }]) {
+      const data = await revokeData();
+      data.inputs.push({ $kind: 'Pure', Pure: { bytes: '' } });
+      data.commands[0].MoveCall.arguments[slot] = arg;
+      expect(() => check(data)).toThrow(/gas coin|cap input|allowance object input/);
+    }
+  }
+  for (const [slot, kind] of [[0, 'SharedObject'], [0, 'Receiving'], [1, 'Receiving']]) {
+    const data = await revokeData();
+    data.inputs[slot].Object = { $kind: kind, [kind]: ref(OBJ_A) };
+    expect(() => check(data)).toThrow(/cap input|receiving inputs/);
+  }
+});
+
+test('revoke cannot launder gas splits or manufacture sponsor income', async () => {
+  const data = await revokeData();
+  data.commands.push({ $kind: 'TransferObjects', TransferObjects: {
+    objects: [{ $kind: 'Result', Result: 0 }], address: { $kind: 'Input', Input: 2 },
+  } });
+  data.inputs.push({ $kind: 'Pure', Pure: { bytes: Buffer.from(SPONSOR.slice(2), 'hex').toString('base64') } });
+  expect(() => check(data)).toThrow(/fee recipient may only receive/);
+
+  const drain = await dataFor((tx) => {
+    const [coin] = tx.splitCoins(tx.gas, [1_000_000]);
+    tx.moveCall({ target: '0x2::allowance::revoke', typeArguments: ['u64'],
+      arguments: [coin, tx.objectRef(ref(OBJ_B))] });
+  });
+  expect(() => check(drain)).toThrow(/cap input/);
+});
+
+test('shared allowance cleanup payouts remain bounded by actual gas rebates', async () => {
+  const data = await revokeData();
+  const payout = await dataFor((tx) => {
+    const [coin] = tx.splitCoins(tx.gas, [7_000_000]);
+    tx.transferObjects([coin], tx.pure.address(USER));
+  });
+  // offset the appended input and result references to preserve the serialized shape
+  payout.commands[0].SplitCoins.amounts[0].Input += data.inputs.length;
+  payout.commands[1].TransferObjects.address.Input += data.inputs.length;
+  payout.commands[1].TransferObjects.objects[0].NestedResult[0] += data.commands.length;
+  data.inputs.push(...payout.inputs);
+  data.commands.push(...payout.commands);
+  const { splitToSenderMist } = check(data);
+  expect(splitToSenderMist).toBe(7_000_000n);
+  expect(gasCoinNetMist({ computationCost: '1000000', storageCost: '3000000', storageRebate: '10000000' }, splitToSenderMist)).toBe(-1_000_000n);
+});
+
+const keepTokensData = (recipient = USER, typeArguments = ['0xabc::foo::FOO']) =>
+  dataFor((tx) => {
+    tx.moveCall({
+      target: '0x2::coin::send_funds',
+      typeArguments,
+      arguments: [tx.objectRef(ref(OBJ_A)), tx.pure.address(recipient)],
+    });
+  });
+
+test.each(['0xabc::foo::FOO', '0x2::sui::SUI'])(
+  'accepts keep_tokens sending an owned %s coin to the declared sender',
+  async (coinType) => {
+    expect(check(await keepTokensData(USER, [coinType]))).toEqual({
+      totalSplitFromGas: 0n,
+      splitToSenderMist: 0n,
+    });
+  }
+);
+
+test.each([SPONSOR, ATTACKER])('rejects keep_tokens recipient %s', async (recipient) => {
+  const data = await keepTokensData(recipient);
+  expect(() => check(data)).toThrow(/send_funds.*sender/);
+});
+
+test.each([{ types: [] }, { types: ['0x2::sui::SUI', '0xabc::foo::FOO'] }])(
+  'rejects send_funds with type arguments %j',
+  async ({ types }) => {
+    const data = await keepTokensData(USER, types);
+    expect(() => check(data)).toThrow(/exactly 1 type argument/);
+  }
+);
+
+test.each([0, 1, 3])('rejects send_funds with %i arguments', async (count) => {
+  const data = await keepTokensData();
+  const args = data.commands[0].MoveCall.arguments;
+  data.commands[0].MoveCall.arguments = count === 3 ? [...args, args[0]] : args.slice(0, count);
+  expect(() => check(data)).toThrow(/exactly 2 arguments/);
+});
+
+test.each([
+  { $kind: 'GasCoin', GasCoin: true },
+  { $kind: 'Result', Result: 0 },
+  { $kind: 'NestedResult', NestedResult: [0, 0] },
+  { $kind: 'Input', Input: 1 },
+])('rejects send_funds coin argument %j', async (arg) => {
+  const data = await keepTokensData();
+  data.commands[0].MoveCall.arguments[0] = arg;
+  expect(() => check(data)).toThrow(
+    arg.$kind === 'GasCoin' ? /references the gas coin/ : /owned, version-pinned/
+  );
+});
+
+test.each(['SharedObject', 'Receiving'])(
+  'rejects send_funds with a %s coin input',
+  async (kind) => {
+    const data = await keepTokensData();
+    data.inputs[0].Object = { $kind: kind, [kind]: ref(OBJ_A) };
+    expect(() => check(data)).toThrow(/owned, version-pinned|receiving inputs/);
+  }
+);
+
+test.each([
+  { $kind: 'GasCoin', GasCoin: true },
+  { $kind: 'Result', Result: 0, Input: 1 },
+  { $kind: 'NestedResult', NestedResult: [0, 0], Input: 1 },
+  { $kind: 'Input', Input: 0 },
+])('rejects send_funds recipient argument %j', async (arg) => {
+  const data = await keepTokensData();
+  data.commands[0].MoveCall.arguments[1] = arg;
+  expect(() => check(data)).toThrow(
+    arg.$kind === 'GasCoin' ? /references the gas coin/ : /literal.*sender/
+  );
+});
+
+test('rejects laundering a sponsor gas split through send_funds', async () => {
+  const data = await dataFor((tx) => {
+    const [coin] = tx.splitCoins(tx.gas, [1_000_000]);
+    tx.moveCall({
+      target: '0x2::coin::send_funds',
+      typeArguments: ['0x2::sui::SUI'],
+      arguments: [coin, tx.pure.address(USER)],
+    });
+  });
+  expect(() => check(data)).toThrow(/owned, version-pinned/);
+});
 
 test('accepts a normal reclaim batch', async () => {
   const data = await dataFor((tx) => {

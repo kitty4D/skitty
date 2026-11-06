@@ -1,5 +1,8 @@
 import { Transaction } from '@mysten/sui/transactions';
-import type { CleanupAction, MergeCoinsAction, DestroyZeroAction, CloseKioskAction, BurnAction } from './types';
+import type { CleanupAction, MergeCoinsAction, KeepTokensAction, DestroyZeroAction, CloseKioskAction, BurnAction } from './types';
+import { normalizeSuiObjectId } from '@mysten/sui/utils';
+import { isSameMoveType } from './constants';
+import { getCoinTypeArg } from './walletBlocklist';
 import { MAX_MERGES_PER_BATCH, MAX_ACTIONS_PER_BATCH, FEE_RATE, FEE_RECIPIENT, REBATE_MULTIPLIER, SUI_COIN_TYPE_ARG } from './constants';
 
 const KIOSK_CLOSE_TARGET = '0x2::kiosk::close_and_withdraw';
@@ -33,6 +36,9 @@ export interface BuildBatchOptions {
   estimatedGasMist?: number | null;
   /** user-owned coins that must not be consumed as merge/destroy inputs */
   gasCoinId?: string | null;
+  gasCoinIds?: string[];
+  /** self-paid SUI consolidation keeps the reserved payment coin as the destination */
+  mergeSuiIntoGas?: boolean;
   feeCoinId?: string | null;
   /**
    * self-paid only: where the service fee is drawn from, and the most it may take.
@@ -88,23 +94,45 @@ export function buildBatchTransaction(
 ): BuildBatchResult {
   const tx = new Transaction();
   const sponsoredGas = Boolean(options.sponsoredGas && options.senderAddress);
+  if (sponsoredGas && actions.some(action => action.selfPaidOnly || action.kind === 'withdraw_kiosk')) {
+    throw new Error('This selection needs SUI in your wallet for gas.');
+  }
   const estimatedGasMist = options.estimatedGasMist ?? null;
   const selfPaidFee = sponsoredGas ? null : options.selfPaidFee ?? null;
 
   const excludeFromCoins = new Set(
-    [options.gasCoinId, options.feeCoinId].filter(Boolean) as string[]
+    [...(options.gasCoinIds ?? []), options.gasCoinId, options.feeCoinId]
+      .filter((id): id is string => Boolean(id)).map((id) => normalizeSuiObjectId(id))
   );
+  const excluded = (id: string) => excludeFromCoins.has(normalizeSuiObjectId(id));
+  const claimed = new Set<string>();
+  for (const action of actions) {
+    for (const id of action.objectIds) {
+      const normalized = normalizeSuiObjectId(id);
+      if (claimed.has(normalized)) throw new Error('Selected actions overlap. Choose merge or keep tokens for each coin.');
+      claimed.add(normalized);
+    }
+  }
+  const subset = <T extends CleanupAction>(action: T, objectIds: string[]): T => ({
+    ...action, objectIds,
+    objectStorageRebates: objectIds.map((id) => String(rebateForObject(action, id))),
+    ...('objectBalances' in action ? {
+      objectBalances: objectIds.map((id) => action.objectBalances?.[action.objectIds.indexOf(id)] ?? '0'),
+    } : {}),
+  });
 
   // ---- pass 1: decide what actually fits, and what rebate that really realizes ----
   // The fee and the sponsored user share must be derived from the objects this PTB
   // destroys, not from everything the user selected: a merge keeps its primary coin
   // alive, and the batch cap silently drops the tail. Paying out on the full total
   // draws the difference from the sponsor's gas coin.
-  type MergeGroup = { ids: string[]; rebateById: Map<string, number> };
+  type MergeGroup = { ids: string[]; smashedIds: string[]; rebateById: Map<string, number>; action: MergeCoinsAction; intoGas: boolean };
   const mergeGroups = new Map<string, MergeGroup>();
   const destroyZero: { action: DestroyZeroAction; objectIds: string[] }[] = [];
   const closeKiosks: CloseKioskAction[] = [];
   const burns: { action: BurnAction; objectIds: string[] }[] = [];
+  const deposits: { action: KeepTokensAction; objectIds: string[] }[] = [];
+  const additional: CleanupAction[] = [];
   const includedActions: CleanupAction[] = [];
 
   let actionCount = 0;
@@ -119,28 +147,69 @@ export function buildBatchTransaction(
       continue;
     }
     switch (action.kind) {
+      case 'empty_container':
+      case 'expired_walrus':
+      case 'revoke_allowance':
+      case 'withdraw_kiosk': {
+        if (!options.senderAddress) throw new Error('senderAddress is required for this action.');
+        additional.push(action);
+        includedActions.push(action);
+        realizedRebate += Number(action.storageRebateTotal);
+        includedGasMist += action.estimatedGasMist;
+        actionCount += 1;
+        break;
+      }
       case 'merge_coins': {
         const a = action as MergeCoinsAction;
-        const ids = a.objectIds.filter((id) => !excludeFromCoins.has(id));
-        if (ids.length <= 1) continue;
-        const group: MergeGroup = mergeGroups.get(a.coinType) ?? { ids: [], rebateById: new Map() };
+        const ids = a.objectIds.filter((id) => !excluded(id));
+        const intoGas = !sponsoredGas && Boolean(options.mergeSuiIntoGas) &&
+          isSameMoveType(getCoinTypeArg(a.coinType), SUI_COIN_TYPE_ARG);
+        const smashedIds = intoGas ? a.objectIds.filter((id) =>
+          (options.gasCoinIds ?? []).slice(1).some((payment) => normalizeSuiObjectId(payment) === normalizeSuiObjectId(id))
+        ) : [];
+        if (intoGas ? ids.length + smashedIds.length === 0 : ids.length < 2) continue;
+        const group: MergeGroup = mergeGroups.get(a.coinType) ?? {
+          ids: [], smashedIds: [], rebateById: new Map(), action: a, intoGas,
+        };
         for (const id of ids) {
           if (!group.rebateById.has(id)) {
             group.ids.push(id);
             group.rebateById.set(id, rebateForObject(a, id));
           }
         }
+        for (const id of smashedIds) {
+          if (!group.rebateById.has(id)) {
+            group.smashedIds.push(id);
+            group.rebateById.set(id, rebateForObject(a, id));
+          }
+        }
         mergeGroups.set(a.coinType, group);
-        includedActions.push(a);
         includedGasMist += a.estimatedGasMist;
         actionCount += 1;
+        break;
+      }
+      case 'keep_tokens': {
+        if (!options.senderAddress) throw new Error('senderAddress is required to keep tokens in the owner address balance.');
+        const ids: string[] = [];
+        for (const id of action.objectIds) {
+          if (excluded(id)) continue;
+          if (actionCount >= cap) { droppedActionCount += 1; continue; }
+          ids.push(id);
+          realizedRebate += rebateForObject(action, id);
+          actionCount += 1;
+        }
+        if (!ids.length) continue;
+        const included = subset(action, ids);
+        deposits.push({ action: included, objectIds: ids });
+        includedActions.push(included);
+        includedGasMist += gasForIncluded(action, ids.length);
         break;
       }
       case 'destroy_zero': {
         const a = action as DestroyZeroAction;
         const ids: string[] = [];
         for (const objectId of a.objectIds) {
-          if (excludeFromCoins.has(objectId)) continue;
+          if (excluded(objectId)) continue;
           if (actionCount >= cap) {
             droppedActionCount += 1;
             continue;
@@ -152,7 +221,7 @@ export function buildBatchTransaction(
         }
         if (ids.length === 0) continue;
         destroyZero.push({ action: a, objectIds: ids });
-        includedActions.push(a);
+        includedActions.push(subset(a, ids));
         includedGasMist += gasForIncluded(a, ids.length);
         break;
       }
@@ -179,7 +248,7 @@ export function buildBatchTransaction(
         }
         if (ids.length === 0) continue;
         burns.push({ action: a, objectIds: ids });
-        includedActions.push(a);
+        includedActions.push(subset(a, ids));
         includedGasMist += gasForIncluded(a, ids.length);
         break;
       }
@@ -187,14 +256,17 @@ export function buildBatchTransaction(
   }
 
   // a merge of N coins deletes N-1: the primary survives and its rebate is never realized
-  const mergePlans: { primary: string; rest: string[] }[] = [];
+  const mergePlans: { primary: string | null; rest: string[] }[] = [];
   for (const [, group] of mergeGroups) {
     const batch = group.ids.slice(0, MAX_MERGES_PER_BATCH);
     droppedActionCount += group.ids.length - batch.length;
-    if (batch.length <= 1) continue;
-    const [primary, ...rest] = batch;
-    mergePlans.push({ primary: primary!, rest });
+    if (group.intoGas ? batch.length + group.smashedIds.length === 0 : batch.length < 2) continue;
+    const [primary, ...sources] = batch;
+    const rest = group.intoGas ? batch : sources;
+    if (rest.length) mergePlans.push({ primary: group.intoGas ? null : primary!, rest });
+    includedActions.push(subset(group.action, [...batch, ...group.smashedIds]));
     for (const id of rest) realizedRebate += group.rebateById.get(id) ?? 0;
+    for (const id of group.smashedIds) realizedRebate += group.rebateById.get(id) ?? 0;
   }
 
   const storageRebateMist = Math.max(0, Math.floor(realizedRebate));
@@ -212,6 +284,32 @@ export function buildBatchTransaction(
   }
 
   // ---- pass 2: emit commands ----
+  for (const action of additional) {
+    if (action.kind === 'withdraw_kiosk') {
+      if (!/^\d+$/.test(action.proceedsMist) || BigInt(action.proceedsMist) <= 0n || BigInt(action.proceedsMist) > 18446744073709551615n) {
+        throw new Error('Invalid kiosk proceeds amount. Rescan this wallet.');
+      }
+      // fix the amount to the reviewed quote; new sales stay in the kiosk.
+      const [coin] = tx.moveCall({target:'0x2::kiosk::withdraw',arguments:[
+        tx.object(action.kioskId),tx.object(action.ownerCapId),tx.pure.option('u64',action.proceedsMist),
+      ]});
+      tx.moveCall({target:COIN_SEND_FUNDS_TARGET,typeArguments:[SUI_COIN_TYPE_ARG],
+        arguments:[coin,tx.pure.address(options.senderAddress!)]});
+    } else if (action.kind === 'empty_container' || action.kind === 'expired_walrus' || action.kind === 'revoke_allowance') {
+      const ids = action.kind === 'empty_container' ? action.objectIds : action.callObjectIds;
+      tx.moveCall({target:action.moveTarget as `${string}::${string}::${string}`,
+        typeArguments:action.typeArguments,arguments:ids.map(id => tx.object(id))});
+    }
+  }
+  for (const { action, objectIds } of deposits) {
+    for (const objectId of objectIds) {
+      tx.moveCall({
+        target: COIN_SEND_FUNDS_TARGET,
+        typeArguments: [getCoinTypeArg(action.coinType)],
+        arguments: [tx.object(objectId), tx.pure.address(options.senderAddress!)],
+      });
+    }
+  }
   for (const { action, objectIds } of destroyZero) {
     const [pkg, mod, name] =
       action.coinType.match(/^(0x[a-fA-F0-9]+)::([^:]+)::([^<]+)/)?.slice(1) ?? [];
@@ -263,7 +361,7 @@ export function buildBatchTransaction(
 
   for (const plan of mergePlans) {
     tx.mergeCoins(
-      tx.object(plan.primary),
+      plan.primary == null ? tx.gas : tx.object(plan.primary),
       plan.rest.map((id) => tx.object(id))
     );
   }

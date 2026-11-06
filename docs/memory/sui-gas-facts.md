@@ -1,33 +1,47 @@
-# sui gas facts
+# Sui gas observations
 
-all verified against mainnet by simulation, sdk `@mysten/sui` 2.7.0, protocol ~v134, sept 2026. re-verify before building on any of it; this layer is moving.
+the code depends on these distinctions. the earlier gas experiments used SDK 2.7.0 and mainnet around september 2026. november 6 checks exercised the added cleanup calls. those are dated observations, not a fresh check of every protocol flag or wallet version
 
-## rebates
+## rebates and available funds
 
-- storage rebates are credited to the GAS PAYER, not the sender. so in a sponsored reclaim the recovered SUI is the sponsor's the instant it exists.
-- rebates land when execution ENDS. anything split out of `tx.gas` mid-PTB comes out of the gas coin's existing balance, not the rebate. that's why the sponsor's coin needs `budget + payout` and a self-paying user needs `budget + fee`.
-- spendable through `tx.gas` is exactly `payment total - budget`. one mist over aborts with insufficient coin balance.
+rebates are credited to the gas payer when execution finishes. with sponsorship that is the sponsor, so the user's share has to be paid separately
 
-## address balances
+a split during execution uses existing gas-coin funds. the earlier simulations found spendable value was payment total minus budget. skitty's coin selection therefore requires the sponsor's initial budget plus payout. self-paid fees are capped after reserving gas
 
-- a wallet funded by a recent transfer often holds all of its SUI as an address balance and owns zero usable coins. that's the normal case now, not an edge case.
-- `getBalance` returns `balance`, `coinBalance`, `addressBalance`. only `coinBalance` is coin objects.
-- address-balance gas = empty gas payment + `ValidDuring` expiration (max two epochs) when there are no address-owned inputs.
-- the sdk resolver only picks the address balance if the PTB never references `GasCoin` and `addressBalance >= budget + withdrawals`. otherwise it lists coin objects.
-- `tx.withdrawal()` yields `funds_accumulator::Withdrawal<Balance<T>>`, NOT a `Balance<T>`. redeem it with `coin::redeem_funds` (returns `Coin`) or `balance::redeem_funds` (returns `Balance`). `coin::from_balance` rejects it.
-- `balance::send_funds(Balance, address)` and `coin::send_funds(Coin, address)` deposit into the recipient's address balance and create no object.
-- withdrawals draw only on the SENDER. `withdrawFrom: Sponsor` is rejected ("explicit sponsor withdrawals are not yet supported").
-- a withdrawal reservation IS checked in simulation, down to the mist.
+the builder applies `REBATE_MULTIPLIER = 0.99` to its planned storage rebate, then subtracts gas and the service fee. that's an app quote. don't label every reported `storageRebate` value as a gross deposit or infer the exact current protocol burn from that multiplier. simulated effects report their own storage rebate and nonrefundable fee
 
-## simulation lies
+## address balances and withdrawals
 
-- with an empty gas payment, simulation does not check the payer at all. an address holding zero SUI "successfully" simulates `splitCoins(tx.gas)` with a 5 SUI budget.
-- with an explicit coin payment, it's checked ("balance of gas object 0 is lower than the needed amount").
-- the graphql resolver does server-side gas selection when payment is unset and fails loudly when nothing covers it.
+`getBalance` separates aggregate balance, coin-object balance, and address balance. the current app can use address-balance gas for self-paid transactions and sponsor-owned conversion
 
-## sponsor constraints that follow
+`tx.withdrawal()` returns `funds_accumulator::Withdrawal<Balance<T>>`, not `Balance<T>`. use `coin::redeem_funds` for a Coin or `balance::redeem_funds` for a Balance. passing the withdrawal directly to `coin::from_balance` failed the earlier type check
 
-- a sponsor-owned coin can't be an ordinary PTB input (owned inputs are checked against the sender). the `GasCoin` argument is the only channel for sponsor value to reach a user in a user-sent tx.
-- so the sponsor needs a `Coin<SUI>` object. its address balance can't pay for skitty: wallets re-resolve an empty payment against the sender, the balance gate can't be verified, and `address_balance_gas_reject_gas_coin_arg` (currently off) would reject the shape outright.
+`coin::send_funds` and `balance::send_funds` deposit into an address balance without making a replacement coin object. keep-token cleanup uses that to remove coin wrappers while preserving their tokens
 
-related: [gas modes](gas-modes.md)
+earlier mainnet checks rejected explicit sponsor withdrawals. ordinary owned inputs were checked against the sender, so a sponsor-owned coin couldn't be used as an ordinary user input. storage rebates also arrive too late to fund a mid-transaction payout. the sponsored user payout therefore still uses `tx.gas`
+
+transactions without address-owned inputs needed `ValidDuring` expiration covering at most two epochs. the conversion builder supplies current/next epoch, chain identifier, and nonce. the earlier simulation didn't enforce the expiration rule that execution did
+
+## simulation limits
+
+with empty gas payment, earlier simulations succeeded even when the supposed gas payer couldn't afford the budget or split. that isn't funding evidence
+
+withdrawal reservations were checked against real address balance. explicit gas coin payments were also checked. these are separate checks, so a successful withdrawal doesn't prove the remaining balance covers gas
+
+the self-paid planner reads holdings before pricing and before signing the resolved plan. its measuring draft uses empty payment only to price the commands. the final resolver/payment choice still has to be affordable
+
+the self-paid address-balance route never references `GasCoin`. the SDK resolution path used in the earlier checks chose address balance only when the transaction avoided that argument and the balance covered budget plus withdrawals
+
+## sponsor consequence
+
+user cleanup sponsorship requires a real `Coin<SUI>` payment. an earlier wallet rebuilt an empty payment against the user and rejected it. an earlier protocol version also exposed `address_balance_gas_reject_gas_coin_arg`; its current setting wasn't checked in this docs update
+
+automatic sponsor conversion is different: the sponsor is also the sender and redeems its own withdrawal into its own coin. that conversion can use address-balance gas without a `GasCoin` argument
+
+## november 6 evidence
+
+read-only mainnet simulations passed keep-token deposits, SUI merges, all four supported container destroy functions, kiosk withdrawal into sender address balance, and a real expired Walrus receipt burn. function lookups confirmed native allowance revocation. these checks didn't sign or submit transactions
+
+empty payment in those Move-call probes tested command behavior only. the normal app's wallet funding checks still matter. [object cleanup](object-cleanup.md) keeps the receipt fixture and measured effects
+
+related: [gas modes](gas-modes.md), [coin cleanup](coin-cleanup.md)

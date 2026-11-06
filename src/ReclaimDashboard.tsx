@@ -8,6 +8,8 @@ import { useGraphQLScanner } from './useGraphQLScanner';
 import { buildBatchTransaction, computeFeeMist } from './buildCleanupTransaction';
 import {
   simulateActions,
+  gasModeForActions,
+  kioskProceedsMist,
   executeActions,
   selfPaidGasSource,
   SponsorUnavailableError,
@@ -15,7 +17,9 @@ import {
 } from './sponsoredTx';
 import { useSponsorStatus } from './useSponsorStatus';
 import { useSuiHoldings } from './useSuiHoldings';
-import { actionKey, actionDomId } from './actionIdentity';
+import { actionKey, actionDomId, selectActionKeys } from './actionIdentity';
+import { selectCleanupGas } from './gasSelection';
+import { totalNonOverlappingNetGainMist } from './coinActions';
 import { SELF_PAY_MIN_GAS_BUDGET_MIST } from './constants';
 import type { CleanupAction } from './types';
 
@@ -36,6 +40,7 @@ import { FloatingCart } from './components/FloatingCart';
 import { SponsorStatusBanner } from './components/SponsorStatusBanner';
 
 // k4d.io answers with a permanent redirect to www, so link the destination and skip the hop
+const reviewKinds = new Set<CleanupAction['kind']>(['empty_container', 'expired_walrus', 'withdraw_kiosk', 'revoke_allowance']);
 const K4D_URL = 'https://www.k4d.io';
 
 const containerVariants = {
@@ -128,9 +133,11 @@ export function ReclaimDashboard() {
 
   const sponsor = useSponsorStatus();
   const { markUnavailable: markSponsorUnavailable, refresh: refreshSponsor } = sponsor;
+  const [payGasWithWallet, setPayGasWithWallet] = React.useState(false);
+  const sponsorshipAvailable = sponsor.availability === 'funded' || sponsor.availability === 'checking';
   // optimistic while the first check is in flight; a refusal from the sponsor flips it
   const gasMode: GasMode =
-    sponsor.availability === 'funded' || sponsor.availability === 'checking' ? 'sponsored' : 'self';
+    sponsorshipAvailable && !payGasWithWallet ? 'sponsored' : 'self';
   const { holdings: walletSui, refresh: refreshWalletSui } = useSuiHoldings(account?.address);
   const walletGas = walletSui ? selfPaidGasSource(walletSui) : null;
   const walletGasSource = walletGas?.source ?? null;
@@ -139,9 +146,9 @@ export function ReclaimDashboard() {
     walletGasAvailableMist != null && walletGasAvailableMist < SELF_PAY_MIN_GAS_BUDGET_MIST;
   const noGasReason =
     gasMode === 'self' && walletHasNoGas
-      ? `No SUI in this wallet for gas. It can't run anything until ${
-          sponsor.availability === 'unfunded' ? 'the sponsor is topped up' : 'sponsorship is back'
-        }.`
+      ? sponsorshipAvailable
+        ? 'fund your wallet with SUI for gas or turn off wallet-paid gas to use sponsorship for eligible actions.'
+        : 'fund your wallet with SUI for gas or wait for sponsorship to return for eligible actions.'
       : null;
 
   // the sponsor refused because it can't pay. flip to self-paid now instead of waiting on
@@ -204,6 +211,27 @@ export function ReclaimDashboard() {
   /** actions awaiting an explicit "yes, destroy these" before we ask the wallet to sign */
   const [pendingConfirm, setPendingConfirm] = React.useState<CleanupAction[] | null>(null);
   const simulationEpochRef = React.useRef(0);
+  const walletEpochRef = React.useRef(0);
+
+  // feedback belongs to one wallet session; disconnecting or switching invalidates it.
+  React.useEffect(() => {
+    walletEpochRef.current += 1;
+    simulationEpochRef.current += 1;
+    setPayGasWithWallet(false);
+    setExecuteError(null);
+    setExecuteNotice(null);
+    setDryRunResult(null);
+    setSimulationModal(null);
+    setLastDryRunRawJson(null);
+    setShowRawSimulation(false);
+    setGeminiError(null);
+    setGeminiExplanation(null);
+    setGeminiLoading(false);
+    setSimulating(false);
+    setSimulatedNetInflowByKey({});
+    setLastSponsorImpact(null);
+    setPendingConfirm(null);
+  }, [account?.address]);
   // keyed by action identity, not list position: a re-scan reorders state.actions and
   // positional keys would silently re-point the cart at different objects
   const [selectedKeys, setSelectedKeys] = React.useState<Set<string>>(new Set());
@@ -212,15 +240,22 @@ export function ReclaimDashboard() {
     setSelectedKeys((prev) => {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
-      else next.add(key);
+      else {
+        const action = state.actions.find((candidate) => actionKey(candidate) === key);
+        if (action) return selectActionKeys(state.actions, prev, [action]);
+      }
       return next;
     });
-  }, []);
+  }, [state.actions]);
 
   const selectedActionList = React.useMemo(
     () => state.actions.filter((a) => selectedKeys.has(actionKey(a))),
     [state.actions, selectedKeys]
   );
+
+  const forcedSelf = selectedActionList.some((a) => a.selfPaidOnly || a.kind === 'withdraw_kiosk');
+  const selectionGasMode: GasMode = gasModeForActions(selectedActionList, gasMode);
+  const forcedNoGasReason = walletHasNoGas ? 'this action needs SUI in your wallet for gas' : null;
 
   // Planning the batch is the only honest source for these numbers: it accounts for the
   // merge primary that survives and for anything the batch cap drops, which is exactly
@@ -230,18 +265,21 @@ export function ReclaimDashboard() {
     if (selectedActionList.length === 0 || !senderAddress) return null;
     try {
       // no gas figure: the build charges only for the actions that fit under the cap
-      if (gasMode === 'sponsored') {
+      if (selectionGasMode === 'sponsored') {
         return buildBatchTransaction(selectedActionList, { sponsoredGas: true, senderAddress });
       }
+      const gas = walletSui ? selectCleanupGas(selectedActionList, walletSui, SELF_PAY_MIN_GAS_BUDGET_MIST) : null;
       return buildBatchTransaction(selectedActionList, {
         sponsoredGas: false,
         senderAddress,
+        gasCoinIds: gas?.coins.map((coin) => coin.objectId),
+        mergeSuiIntoGas: gas?.source === 'gasCoin',
         // holdings not read yet: quote the full fee rather than understate it
         selfPaidFee: {
-          source: walletGasSource ?? 'addressBalance',
+          source: gas?.source ?? walletGasSource ?? 'addressBalance',
           maxMist:
-            walletGasAvailableMist != null
-              ? walletGasAvailableMist - SELF_PAY_MIN_GAS_BUDGET_MIST
+            gas != null
+              ? gas.availableMist - SELF_PAY_MIN_GAS_BUDGET_MIST
               : Number.MAX_SAFE_INTEGER,
         },
       });
@@ -252,9 +290,9 @@ export function ReclaimDashboard() {
     selectedActionList,
     account?.address,
     state.scannedAddress,
-    gasMode,
+    selectionGasMode,
     walletGasSource,
-    walletGasAvailableMist,
+    walletSui,
   ]);
 
   const totalSelectedRebateMist = batchPreview?.userRebateMist ?? 0;
@@ -264,19 +302,20 @@ export function ReclaimDashboard() {
   const feeMist = batchPreview?.feeMist ?? 0;
   // sponsored, the user's share is an explicit transfer; self-paid, the rebate lands in
   // their own gas payment, so it's simply what's left after gas and fee (maybe negative)
-  const userShareMist =
-    gasMode === 'sponsored'
+  const proceedsMist = kioskProceedsMist(batchPreview?.includedActions ?? []);
+  const userShareMist = proceedsMist + (
+    selectionGasMode === 'sponsored'
       ? batchPreview?.userShareMist ?? 0
       : batchPreview
         ? batchPreview.userRebateMist - batchPreview.gasMist - batchPreview.feeMist
-        : 0;
+        : 0);
   const droppedActionCount = batchPreview?.droppedActionCount ?? 0;
   const cartBlockedReason =
-    gasMode === 'sponsored'
+    selectionGasMode === 'sponsored'
       ? batchPreview == null
         ? "Rebate doesn't cover gas + fee, so the sponsor won't pay for this."
         : null
-      : noGasReason;
+      : forcedSelf ? forcedNoGasReason : noGasReason;
 
   // One simulate path and one execute path, both taking the actions to act on. These
   // were four near-identical copies; the transaction plumbing now lives in sponsoredTx.
@@ -297,7 +336,9 @@ export function ReclaimDashboard() {
       setGeminiExplanation(null);
       setGeminiError(null);
       try {
-        const outcome = await simulateActions(actions, senderAddress, gasMode);
+        const mode: GasMode = gasModeForActions(actions, gasMode);
+        if (actions.some((a) => a.selfPaidOnly || a.kind === 'withdraw_kiosk') && walletHasNoGas) throw new Error('this action needs SUI in your wallet for gas');
+        const outcome = await simulateActions(actions, senderAddress, mode);
         // a newer simulation (or a selection change) supersedes this result
         if (simulationEpochRef.current !== epoch) return;
         setLastDryRunRawJson(outcome.rawJson);
@@ -335,7 +376,7 @@ export function ReclaimDashboard() {
         if (simulationEpochRef.current === epoch) setSimulating(false);
       }
     },
-    [account?.address, state.scannedAddress, gasMode, sponsorRefusalMessage]
+    [account?.address, state.scannedAddress, gasMode, sponsorRefusalMessage, walletHasNoGas]
   );
 
   const performExecute = React.useCallback(
@@ -349,8 +390,12 @@ export function ReclaimDashboard() {
       setExecuteError(null);
       setExecuteNotice(null);
       setLastSponsorImpact(null);
+      const walletEpoch = walletEpochRef.current;
       try {
-        const outcome = await executeActions(actions, account.address, signTransaction, gasMode);
+        const mode: GasMode = gasModeForActions(actions, gasMode);
+        if (actions.some((a) => a.selfPaidOnly || a.kind === 'withdraw_kiosk') && walletHasNoGas) throw new Error('this action needs SUI in your wallet for gas');
+        const outcome = await executeActions(actions, account.address, signTransaction, mode);
+        if (walletEpochRef.current !== walletEpoch) return;
         setDryRunResult(null);
         // drop only what was executed, so running one card does not empty the whole queue
         const executedKeys = new Set(outcome.executedActions.map(actionKey));
@@ -373,6 +418,7 @@ export function ReclaimDashboard() {
         refreshSponsor();
         await refreshAfterExecute(outcome.executedActions);
       } catch (e) {
+        if (walletEpochRef.current !== walletEpoch) return;
         setExecuteError(sponsorRefusalMessage(e) ?? (e instanceof Error ? e.message : String(e)));
       } finally {
         // no safety timer: this always runs, and a timer that fires mid-signing would
@@ -383,6 +429,7 @@ export function ReclaimDashboard() {
     [
       account?.address,
       signTransaction,
+      walletHasNoGas,
       refreshAfterExecute,
       gasMode,
       sponsorRefusalMessage,
@@ -397,8 +444,8 @@ export function ReclaimDashboard() {
     (actions: CleanupAction[]) => {
       // a second flow over the same objects can equivocate them, so one at a time
       if (actions.length === 0 || executing) return;
-      const destructive = actions.some((a) => a.kind === 'burn' || a.kind === 'close_kiosk');
-      if (destructive) setPendingConfirm(actions);
+      const needsConfirmation = actions.some((a) => a.kind === 'burn' || a.kind === 'close_kiosk' || a.kind === 'keep_tokens' || reviewKinds.has(a.kind));
+      if (needsConfirmation) setPendingConfirm(actions);
       else void performExecute(actions);
     },
     [performExecute, executing]
@@ -408,7 +455,7 @@ export function ReclaimDashboard() {
   // when who pays gas changes, since every one of them was priced for the other payer
   React.useEffect(() => {
     setSimulatedNetInflowByKey({});
-  }, [state.scannedAddress, state.actions, gasMode]);
+  }, [state.scannedAddress, state.actions, gasMode, selectionGasMode]);
 
   // a simulation belongs to the selection it was run for; changing the queue invalidates
   // it, and bumping the epoch stops an in-flight one from landing afterwards
@@ -416,9 +463,10 @@ export function ReclaimDashboard() {
     simulationEpochRef.current += 1;
     setSimulating(false);
     setDryRunResult(null);
-  }, [selectedKeys]);
+  }, [selectedKeys, selectionGasMode]);
 
   const feedSkitty = React.useCallback(async () => {
+    const walletEpoch = walletEpochRef.current;
     const raw = lastDryRunRawJson ?? '';
     const len = raw.length;
     const check = canRequestExplain(len);
@@ -443,6 +491,7 @@ export function ReclaimDashboard() {
         body: JSON.stringify({ transactionData }),
       });
       const data = await res.json().catch(() => ({}));
+      if (walletEpochRef.current !== walletEpoch) return;
       if (!res.ok) {
         const msg = data?.error ?? `Request failed (${res.status})`;
         const retry = data?.retryAfterSeconds;
@@ -451,9 +500,10 @@ export function ReclaimDashboard() {
       }
       setGeminiExplanation(data?.explanation ?? 'No explanation returned.');
     } catch (e) {
+      if (walletEpochRef.current !== walletEpoch) return;
       setGeminiError(e instanceof Error ? e.message : 'Failed to get explanation');
     } finally {
-      setGeminiLoading(false);
+      if (walletEpochRef.current === walletEpoch) setGeminiLoading(false);
     }
   }, [lastDryRunRawJson]);
 
@@ -467,17 +517,28 @@ export function ReclaimDashboard() {
     return map;
   }, [state.actions]);
 
-  const kindOrder: CleanupAction['kind'][] = ['merge_coins', 'destroy_zero', 'close_kiosk', 'burn'];
+  const kindOrder: CleanupAction['kind'][] = ['keep_tokens', 'merge_coins', 'destroy_zero', 'close_kiosk', 'burn', 'empty_container', 'expired_walrus', 'withdraw_kiosk', 'revoke_allowance'];
   const kindTitles: Record<CleanupAction['kind'], string> = {
+    keep_tokens: 'keep tokens, recover storage',
     merge_coins: 'Merge Coins',
     destroy_zero: 'Destroy Coins',
     close_kiosk: 'Close Kiosk',
     burn: 'Attempt Burn',
+    empty_container: 'empty containers',
+    expired_walrus: 'expired Walrus receipts',
+    withdraw_kiosk: 'withdraw kiosk proceeds',
+    revoke_allowance: 'revoke native Sui allowances',
   };
 
   const kindDescriptions: Record<CleanupAction['kind'], string> = {
+    empty_container: 'only directly wallet-owned empty Bag, Table, ObjectBag, and ObjectTable objects are accessible. wrapped containers are inaccessible. deletion is permanent.',
+    expired_walrus: 'delete expired Walrus receipts to recover SUI storage only. this does not refund WAL.',
+    withdraw_kiosk: 'withdraw the full observed proceeds to your own address balance. the kiosk and owner cap stay alive. no fee is charged on proceeds.',
+    revoke_allowance: 'only native Sui allowances owned by your cap are listed, not all protocol permissions. revocation explicitly changes spending access.',
+    keep_tokens:
+      'Move coin objects into your own address balance. You keep every token; only their object IDs are removed. Choosing this replaces any merge selected for the same coins. When you pay your own gas, gas-payment coins stay in your wallet.',
     merge_coins:
-      'You have multiple coin objects of the same type. Merging combines them into one object, reducing on-chain storage.',
+      'Combine coins of the same type, including SUI, into one coin without losing tokens. For self-paid SUI consolidation the reserved gas coin is the destination. Choosing merge replaces keep-tokens selections for the same coins.',
     destroy_zero:
       'These coin objects have zero balance. Destroying them reclaims the storage they occupy.',
     close_kiosk:
@@ -487,7 +548,7 @@ export function ReclaimDashboard() {
   };
 
   const showSelectAllForKind = (kind: CleanupAction['kind']) =>
-    kind === 'merge_coins' || kind === 'destroy_zero';
+    kind === 'merge_coins' || kind === 'destroy_zero' || kind === 'keep_tokens';
 
   const selectAllForKind = (kind: CleanupAction['kind']) => {
     const items = actionsByKind.get(kind) ?? [];
@@ -496,7 +557,7 @@ export function ReclaimDashboard() {
       const allSelected = keys.length > 0 && keys.every((k) => prev.has(k));
       const next = new Set(prev);
       if (allSelected) keys.forEach((k) => next.delete(k));
-      else keys.forEach((k) => next.add(k));
+      else return selectActionKeys(state.actions, prev, items.map(({ action }) => action));
       return next;
     });
   };
@@ -586,7 +647,7 @@ export function ReclaimDashboard() {
 
       <main className="mx-auto max-w-5xl px-6 py-12 space-y-12 pb-48">
         <AnimatePresence>
-          {gasMode === 'self' && (
+          {!sponsorshipAvailable && (
             <SponsorStatusBanner
               key="sponsor-status"
               availability={sponsor.availability}
@@ -596,6 +657,30 @@ export function ReclaimDashboard() {
             />
           )}
         </AnimatePresence>
+
+        {sponsorshipAvailable && (
+          <div className="border border-white/20 bg-white/5 p-4 space-y-2">
+            <label className="flex items-center gap-3 text-sm cursor-pointer">
+              <input
+                type="checkbox"
+                checked={payGasWithWallet}
+                disabled={executing || simulating}
+                onChange={(event) => {
+                  setPayGasWithWallet(event.target.checked);
+                  setPendingConfirm(null);
+                }}
+                className="accent-skitty-accent"
+              />
+              pay gas with my wallet
+            </label>
+            {payGasWithWallet && (
+              <p className="text-sm text-amber-400" role="status">
+                you chose wallet-paid gas. your wallet covers the cost even when storage rebates don't cover gas. sponsorship remains available for eligible actions when you turn this off. nothing runs until you simulate or execute.
+              </p>
+            )}
+            {payGasWithWallet && noGasReason && <p className="text-sm text-amber-400">{noGasReason}</p>}
+          </div>
+        )}
 
         <motion.div
           initial={{ y: 20, opacity: 0 }}
@@ -682,6 +767,7 @@ export function ReclaimDashboard() {
         </motion.div>
 
         <WarningsBlock />
+        {state.warnings?.map((warning, index) => <Alert key={index}><AlertDescription>{warning}</AlertDescription></Alert>)}
 
         {/* the cart unmounts once a queue clears, so execution failures need a home on the page too */}
         <AnimatePresence>
@@ -721,7 +807,7 @@ export function ReclaimDashboard() {
           />
         )}
 
-        {!state.loading && state.scannedAddress && state.actions.length > 0 && (
+        {!state.loading && state.scannedAddress && (
           <motion.div
             variants={containerVariants}
             initial="hidden"
@@ -732,7 +818,7 @@ export function ReclaimDashboard() {
               <div>
                 <h2 className="font-display font-black text-4xl uppercase tracking-tighter leading-none">Recoverable Assets</h2>
                 <p className="text-xs font-black uppercase tracking-widest text-skitty-accent mt-2">
-                  Est. net potential: {formatSui(state.actions.reduce((s, a) => s + Math.max(0, a.userRebateMist - computeFeeMist(Number(a.storageRebateTotal)) - a.estimatedGasMist), 0))} SUI
+                  Est. net potential: {formatSui(totalNonOverlappingNetGainMist(state.actions))} SUI
                 </p>
                 <p className="text-[9px] font-mono text-skitty-secondary/70 mt-0.5">
                   Based on current state; actual amounts at execution may differ.
@@ -743,12 +829,12 @@ export function ReclaimDashboard() {
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
               {kindOrder.map((kind) => {
                 const items = actionsByKind.get(kind) ?? [];
-                if (items.length === 0) return null;
+                if (items.length === 0 && !reviewKinds.has(kind)) return null;
                 return (
                   <motion.div
                     key={kind}
                     variants={itemVariants}
-                    className="flex flex-col border-3 border-black bg-white/5 shadow-brutal min-h-0"
+                    className={cn('flex flex-col border-3 border-black bg-white/5 shadow-brutal min-h-0', kind === 'keep_tokens' && 'lg:col-span-2 border-green-500/40')}
                   >
                     <div className="bg-black p-4 border-b-3 border-black flex flex-wrap justify-between items-center gap-2 shrink-0">
                       <h3 className="font-display font-black text-xl uppercase tracking-tighter text-white">
@@ -771,11 +857,21 @@ export function ReclaimDashboard() {
                         </span>
                       </div>
                     </div>
+                    {kind === 'keep_tokens' && (
+                      <div className="p-4 bg-green-500/10 border-b border-green-500/20 text-sm space-y-2">
+                        <p className="text-green-300 font-bold">your tokens stay yours. no swap, burn, or donation.</p>
+                        <p className="text-skitty-secondary">destination: your own address balance</p>
+                        <code className="block text-xs break-all select-all">{state.scannedAddress}</code>
+                        <p className="text-xs text-skitty-secondary/80">nothing is selected by default. amounts without verified decimals are shown as raw units. simulate to check gas and the net storage recovery.</p>
+                      </div>
+                    )}
                     <ul className="action-panel-scroll overflow-y-auto flex-1 min-h-0 p-4 space-y-4 max-h-[450px]">
+                      {items.length === 0 && <li className="text-sm text-skitty-secondary">{state.error || state.warnings?.length ? 'discovery may be incomplete. no eligible actions returned; review scan warnings.' : kind === 'empty_container' ? 'no eligible directly wallet-owned empty containers found. wrapped containers are inaccessible.' : kind === 'expired_walrus' ? 'no eligible expired Walrus receipts found.' : kind === 'withdraw_kiosk' ? 'no eligible kiosks with withdrawable proceeds found.' : 'no eligible cap-owned native Sui allowances found. other protocol permissions are outside this scan.'}</li>}
                       {items.map(({ action, key }) => (
                         <ActionCard
                           key={key}
                           action={action}
+                          gasMode={gasModeForActions([action], gasMode)}
                           domId={actionDomId(action)}
                           selected={selectedKeys.has(key)}
                           onToggle={() => toggleAction(key)}
@@ -789,8 +885,10 @@ export function ReclaimDashboard() {
                           executing={executing}
                           simulating={simulating}
                           executeBlockedReason={
-                            gasMode === 'self'
-                              ? noGasReason
+                            gasModeForActions([action], gasMode) === 'self'
+                              ? action.selfPaidOnly || action.kind === 'withdraw_kiosk'
+                                ? forcedNoGasReason
+                                : noGasReason
                               : action.userRebateMist >=
                                   action.estimatedGasMist +
                                     computeFeeMist(Number(action.storageRebateTotal))
@@ -819,7 +917,7 @@ export function ReclaimDashboard() {
             className="p-16 border-3 border-black border-dashed text-center bg-white/5"
           >
             <p className="text-3xl font-black uppercase tracking-tighter text-skitty-secondary/40">
-              Vault is Empty. No reclaimable objects found.
+              no eligible actions returned. review scan warnings for incomplete discovery.
             </p>
           </motion.div>
         )}
@@ -842,7 +940,7 @@ export function ReclaimDashboard() {
               userShareMist={userShareMist}
               droppedActionCount={droppedActionCount}
               dryRunResult={
-                dryRunResult && (dryRunResult.error || dryRunResult.gasMode === gasMode)
+                dryRunResult && (dryRunResult.error || dryRunResult.gasMode === selectionGasMode)
                   ? dryRunResult
                   : null
               }
@@ -855,7 +953,8 @@ export function ReclaimDashboard() {
               executing={executing}
               simulating={simulating}
               accountConnected={!!account?.address}
-              gasMode={gasMode}
+              gasMode={selectionGasMode}
+              proceedsMist={proceedsMist}
               executeBlockedReason={cartBlockedReason}
               lastSponsorImpact={lastSponsorImpact}
               isMinimized={isCartMinimized}
@@ -974,6 +1073,7 @@ export function ReclaimDashboard() {
             0
           );
           const hasDiscovered = destructive.some((a) => a.kind === 'burn' && a.discovered);
+          const kept = pendingConfirm.filter((action) => action.kind === 'keep_tokens');
           return (
             <motion.div
               initial={{ opacity: 0 }}
@@ -989,31 +1089,41 @@ export function ReclaimDashboard() {
                 role="dialog"
                 aria-modal="true"
                 aria-labelledby="confirm-destroy-title"
-                className="bg-black border-3 border-red-500 shadow-[8px_8px_0_#000] p-6 max-w-md w-full"
+                className="bg-black border-3 border-red-500 shadow-[8px_8px_0_#000] p-6 max-w-md w-full max-h-[90vh] overflow-y-auto"
                 onClick={(e) => e.stopPropagation()}
               >
                 <h3
                   id="confirm-destroy-title"
                   className="font-display font-black text-xl uppercase tracking-tighter text-red-400 mb-3"
                 >
-                  Permanently destroy {objectCount} object{objectCount === 1 ? '' : 's'}?
+                  {objectCount > 0 ? `Permanently destroy ${objectCount} object${objectCount === 1 ? '' : 's'}?` : 'review selected actions?'}
                 </h3>
-                <p className="text-sm text-skitty-secondary mb-4 leading-relaxed">
+                {objectCount > 0 && <p className="text-sm text-skitty-secondary mb-4 leading-relaxed">
                   This cannot be undone. These objects are gone for good once the transaction lands - including any in-game progress, airdrop eligibility, or collectible value they carry.
-                </p>
+                </p>}
+                {kept.length > 0 && (
+                  <div className="text-sm text-green-300 mb-4 space-y-2">
+                    <p>all selected tokens move to your own address balance. the original coin object IDs disappear; no tokens are sold, burned, or sent to someone else.</p>
+                    <p className="text-xs break-all">destination: {account?.address}</p>
+                    <p className="text-xs">gas-payment coins stay available for gas. applications that need coin objects can withdraw tokens from your address balance later.</p>
+                  </div>
+                )}
                 <ul className="action-panel-scroll max-h-[180px] overflow-y-auto mb-4 space-y-1 border-2 border-white/10 p-3">
-                  {destructive.map((a) => (
+                  {pendingConfirm.map((a) => (
                     <li
                       key={actionKey(a)}
                       className="text-[10px] font-black uppercase tracking-widest text-white flex justify-between gap-3"
                     >
-                      <span className="truncate" title={a.label ?? ''}>
-                        {a.kind === 'close_kiosk' ? 'CLOSE KIOSK ' : 'BURN '}
-                        {shortLabelFromType(a.label ?? a.objectIds[0] ?? '')}
-                      </span>
-                      <span className="shrink-0 text-skitty-secondary/70">
-                        {a.objectIds.length} obj
-                      </span>
+                      <div className="min-w-0 space-y-2 normal-case">
+                        <p>{kindTitles[a.kind]}: {a.label ?? a.objectIds[0]}</p>
+                        {reviewKinds.has(a.kind) && <p>{kindDescriptions[a.kind]}</p>}
+                        {'details' in a && a.details.map((detail, index) => <p key={index} className="break-all">{detail}</p>)}
+                        {a.kind === 'withdraw_kiosk' && <p>observed proceeds: {formatSui(Number(a.proceedsMist))} SUI. destination: {account?.address}</p>}
+                        {'moveTarget' in a && <p className="break-all">call: {a.moveTarget}{'typeArguments' in a ? ' ' + a.typeArguments.join(', ') : ''}</p>}
+                        {[...new Set([...a.objectIds, ...('callObjectIds' in a ? a.callObjectIds : []), ...('kioskId' in a ? [a.kioskId, a.ownerCapId] : [])])].map((id) => (
+                          <a key={id} href={'https://suivision.xyz/object/' + id} target="_blank" rel="noopener noreferrer" className="block break-all text-skitty-accent underline">{id}</a>
+                        ))}
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -1044,7 +1154,7 @@ export function ReclaimDashboard() {
                       void performExecute(actions);
                     }}
                   >
-                    Destroy them
+                    {'confirm selected actions'}
                   </Button>
                 </div>
               </motion.div>

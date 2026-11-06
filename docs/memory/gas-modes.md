@@ -1,42 +1,48 @@
 # gas modes
 
-who pays gas is decided per page load and can flip mid-session. `GasMode = 'sponsored' | 'self'` (`src/sponsoredTx.ts`).
+`src/sponsoredTx.ts` owns simulation and execution. `GasMode` is `sponsored` or `self`. the dashboard chooses the requested mode, and `gasModeForActions` forces self-paid for kiosk proceeds or any `selfPaidOnly` action
 
-## deciding
+## choosing the payer
 
-- `GET /api/sponsor` returns `{ funded, reason, sponsorAddress }`. reasons: `ok`, `empty`, `address_balance` (convertible, not converted yet), `too_little`, `not_configured`, `unreachable`. edge cached 15s.
-- before answering, both GET and POST convert the sponsor's address balance into a gas coin when no usable coin exists and the balance could make one (see [operations](operations.md)). so a top-up from anyone flips everyone back to sponsored within a poll or two, no terminal involved.
-- `useSponsorStatus` polls it every 60s. `checking` counts as sponsored (optimistic); `unfunded` and `offline` mean self-paid.
-- `funded` means some sponsor coin is strictly bigger than `SPONSOR_GAS_BUDGET_MIST`. a coin of exactly the budget can pay gas but can't pay anyone out.
-- a mid-flow `POST` 503 carries a `code`. `sponsor_unfunded` and `sponsor_not_configured` flip to self-paid immediately (via `markUnavailable`, which also discards any in-flight poll). `sponsor_insufficient` (funded, just not for this payout) and `sponsor_busy` don't flip: a smaller batch or a retry still works.
-- the flip never silently re-runs anything. the user is told the next attempt costs their own gas and has to press it again.
+`useSponsorStatus` polls every 60 seconds. `checking` is optimistic, `funded` requests sponsorship, and `unfunded` or `offline` uses the wallet. a funded status means a coin exceeds the initial sponsor budget, not that it can front every batch
 
-## sponsored
+the user can explicitly choose "pay gas with my wallet" while the sponsor is checking or funded. it's off by default and resets on wallet change. changing the choice clears pending confirmation. it doesn't rerun a failed transaction
 
-unchanged from before: kind bytes to the sponsor, sponsor sets gas owner, payment and budget, simulates, gates, signs. the fee stays inside the sponsor's gas coin; only the user's share is split out.
+a kiosk-proceeds withdrawal forces the entire queue self-paid. it releases earnings without deleting storage. proceeds aren't included in the service-fee base
 
-## self-paid
+a POST refusal with `sponsor_unfunded` or `sponsor_not_configured` switches future attempts to self-paid and tells the user to press again. `sponsor_insufficient` and `sponsor_busy` don't switch modes. smaller batches or retries can still be sponsored
 
-`planSelfPaid` in `src/sponsoredTx.ts`:
+## sponsored path
 
-1. read the sender's SUI: first page of coin objects (balance > 0) and the address balance.
-2. pick ONE source, whichever holds more. gas can't come from both.
-3. below `SELF_PAY_MIN_GAS_BUDGET_MIST` (0.003 SUI) available: refuse with the "no SUI, sponsor is out" message. the UI blocks execute with the same reason and shows it on the banner.
-4. draft: build with empty payment and a 1 SUI budget, fee included at roughly final size, simulate. empty payment is unchecked in simulation, which is exactly why it can price a batch before a budget is chosen. it is NOT evidence the wallet can pay.
-5. budget = max(min, ceil(gross gas * 1.5)). refuse if the source can't cover it.
-6. final build: fee capped at `available - budget`.
-   - coin route: payment pinned to those coins (explicit payment IS checked in simulation), fee = `splitCoins(tx.gas)` then `coin::send_funds`.
-   - address-balance route: payment left for the resolver (it checks budget + withdrawals against the real balance and returns an empty payment), fee = `tx.withdrawal` then `balance::redeem_funds` then `balance::send_funds`. never touches `tx.gas`.
-7. execute simulates the final bytes once more before the wallet sees them, then signs `Transaction.from(bytes)` so the wallet signs exactly what was simulated.
+the browser builds transaction-kind bytes. the server validates the shape, chooses a real sponsor coin, and supplies transaction bytes. simulate-only requests get no signature and don't reserve a coin
 
-fee is waived when the batch doesn't cover its own gas (`userRebate - gas - fee <= 0`). fees land in the sponsor's address balance; `scripts/materialize-gas-coin.mjs` turns that into a usable gas coin.
+execution measures gross gas, rebuilds the included batch, then requests the sponsor signature. the signing path simulates again and checks both gas-coin arithmetic and the sponsor's SUI balance change. the wallet signs the returned transaction and the client submits both signatures
 
-side effect worth knowing: on the coin route every pinned coin gets smashed into the first one, which also pays the user those coins' storage rebates.
+rebates go to the gas payer. the sponsor therefore sends the user's share from its existing coin during execution. the fee stays in that coin. the initial selection check is `coin balance >= 50,000,000 mist + payout`; the signed budget is tightened later
 
-## ui
+## self-paid path
 
-- `SponsorStatusBanner` shows whenever self-paid: title by reason, and always the full sponsor address with copy and explorer link. only a confirmed shortage (`unfunded`) gets the "send SUI here" label; offline just says "sponsor wallet", since a missing key isn't fixed by a top-up.
-- `FloatingCart` shows net cost in red when a self-paid batch loses money, labels gas as the wallet's, and takes `executeBlockedReason` instead of the old `canSponsor`.
-- dry-run results carry their `gasMode` and are hidden when the mode flips; per-card simulated yields are cleared on a flip.
+`planSelfPaid` does this:
 
-related: [sui gas facts](sui-gas-facts.md), [sponsor trust boundary](sponsor-trust-boundary.md)
+1. read one page of up to 50 SUI coins and the address balance. retain positive-balance coins
+2. choose one source with `selectCleanupGas`. SUI cleanup prefers a sufficient address balance, otherwise reserves payment coins, unselected first. other selections prefer the larger source and use the fetched coin pool if coin-paid
+3. require the source to cover the initial 3,000,000 mist budget. don't count proceeds or expected rebates toward available gas
+4. build a measuring draft with an empty payment and a 1 SUI budget. simulate to price the work. that empty payment doesn't prove anyone can pay
+5. raise the budget to at least `ceil(gross cost * 1.5)`. if choosing payment coins changes the source or included work, measure again. stop after six attempts
+6. rebuild with measured gas and a fee capped at `available - budget`. pin coin payments, or leave address-balance selection to the resolver
+7. simulate the final bytes. execution then asks the wallet to sign `Transaction.from(bytes)`, submits, checks execution status, and waits briefly for finality
+
+coin-paid fees use `splitCoins(tx.gas)` then `coin::send_funds`. address-balance fees use `tx.withdrawal`, `balance::redeem_funds`, and `balance::send_funds`, without touching `tx.gas`. both deposit into the fee recipient's address balance and avoid creating another coin
+
+the fee is waived when `userRebate - gas - fee <= 0`. storage accounting uses only included actions. gas-paid SUI merges can be performed entirely by gas smashing. payment coins are never deposited by keep-tokens cleanup
+
+## feedback and limits
+
+- the offline banner follows actual sponsor availability, not voluntary self-payment. it always includes the sponsor address, copy, and explorer links. funding language appears only for a confirmed shortage
+- card and cart modes are derived from their own selections. a self-paid action mustn't be blocked by the sponsor's rebate threshold
+- the queue separates kiosk proceeds from storage and includes proceeds once in the net amount. negative net estimates remain visible
+- disconnecting or changing wallets clears feedback, simulations, explanations, and pending confirmations. epochs reject late responses from the old wallet session
+- an active execution stays locked until it settles. a wallet switch doesn't cancel a transaction already submitted
+- finality timeout is reported as pending, not as proof of failure. an onchain abort isn't reported as success
+
+related: [coin cleanup](coin-cleanup.md), [object cleanup](object-cleanup.md), [gas observations](sui-gas-facts.md)

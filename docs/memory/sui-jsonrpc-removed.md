@@ -1,15 +1,26 @@
-# sui json-rpc is gone
+# GraphQL migration
 
-as of aug 2026, public fullnodes answer every json-rpc method with "method not found. json-rpc on public fullnodes has been deprecated". that covers `sui_getObject`, `suix_getCoins`, `suix_getOwnedObjects`, `sui_getNormalizedMoveModule`, `sui_multiGetObjects`, `sui_getChainIdentifier`, including through `SuiJsonRpcClient`.
+earlier public-fullnode checks returned "method not found" for JSON-RPC calls, including object reads, coin listing, normalized Move modules, and chain identifier. that broke discovery and execution. the old scanner swallowed errors, so failures looked like an empty wallet
 
-it silently broke burn discovery, `refreshAfterExecute` and the whole execute path. the old scanner swallowed errors and returned `[]`, so the symptom was "vault is empty" instead of an error.
+the app now uses `SuiGraphQLClient` throughout. this docs update checked that implementation, not the current behavior of every public RPC endpoint
 
-how to apply: everything goes through `SuiGraphQLClient` in `src/graphql/client.ts`. equivalents: `getObject`/`getObjects`, `listCoins`, `listOwnedObjects`, `getBalance`, `getMoveFunction` (per function; there's no normalized-module call, so burn discovery queries each candidate name), `simulateTransaction`, `executeTransaction`, `waitForTransaction`. `storageRebate` isn't on the typed object response, so raw `graphQLClient.query` is used where it's needed. dapp-kit's `SuiClientProvider` must be handed this client via `createClient`, or it builds a dead json-rpc client from the url.
+## client contract
 
-sdk gotchas:
+`src/graphql/client.ts` exports the shared frontend client. dapp-kit's provider receives it through `createClient`. server handlers create their own GraphQL clients. don't restore a JSON-RPC client as a fallback
 
-- `simulateTransaction` / `executeTransaction` return a union: `result.$kind === 'Transaction' ? result.Transaction : result.FailedTransaction`, with `status`, `effects`, `balanceChanges` nested inside.
-- `graphQLClient.query` resolves graphql errors into `{ errors }` instead of throwing, so an unchecked call reads as "no results".
-- connection page size caps at 50.
+use `getObject`/`getObjects`, `listCoins`, `listOwnedObjects`, `getBalance`, `getMoveFunction`, `simulateTransaction`, `executeTransaction`, and `waitForTransaction`. raw queries provide storage rebates and discovery fields absent from the typed responses
 
-related: [sui gas facts](sui-gas-facts.md)
+burn discovery checks individual candidate functions through `getMoveFunction`. the callable signature matters: one consumed object argument, no unsupported generics or required extra arguments. a borrowed argument doesn't establish destruction
+
+## things that otherwise look like success
+
+- simulation/execution returns a union. choose `result.Transaction` or `result.FailedTransaction` using `$kind`, then check nested `status.success`
+- GraphQL queries can resolve with `errors` instead of throwing. missing or partial data mustn't become "nothing found"
+- connections use `hasNextPage` and `endCursor`. fewer than 50 nodes isn't proof the connection ended. discovery requests use pages of 50
+- token metadata is optional display data. unavailable decimals mean raw units, not an invented decimal count
+- container and receipt queries use 20-second abort signals and report incomplete discovery. receipt paging has a 1,000-page guard. container paging rejects repeated cursors
+- scanner epochs suppress stale responses after a new address or scan. they aren't a general network cancellation mechanism
+
+execution refresh runs a full scan so stale alternatives and partially executed batches are removed. wallet-session epochs separately clear late feedback after disconnect/change
+
+related: [gas observations](sui-gas-facts.md), [object cleanup](object-cleanup.md)

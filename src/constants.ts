@@ -30,6 +30,7 @@ export const SELF_PAY_MAX_GAS_COINS = 50;
 // estimated gas (mist) per action type for net-gain before dry run
 export const ESTIMATED_GAS = {
   mergeCoins: 500,
+  keepTokens: 500,
   destroyZero: 300,
   closeKiosk: 2000,
   burn: 1_200_000,
@@ -43,7 +44,7 @@ export const KNOWN_BURNABLE: { typePattern: string; target: string }[] = [
   // ex. { typePattern: '0x...::token::Token', target: '0x...::token::burn' },
 ];
 
-// native SUI coin type arg: never suggest merge or destroy_zero for SUI (gas coin)
+// native SUI type: consolidation reserves its gas payment; empty SUI destruction stays excluded
 export const SUI_COIN_TYPE_ARG = '0x2::sui::SUI';
 export const SUI_COIN_TYPE_ARG_LONG = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
 

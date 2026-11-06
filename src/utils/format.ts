@@ -4,6 +4,18 @@ export function formatSui(mist: number): string {
   return (mist / MIST_PER_SUI).toFixed(6);
 }
 
+// keep token units exact, including balances too large or too small for a JS number.
+// unknown metadata gets raw units; guessing nine decimals quietly lies about the asset.
+export function formatTokenBalance(raw: string, decimals?: number, symbol?: string): string {
+  if (decimals == null || !Number.isInteger(decimals) || decimals < 0 || decimals > 255) {
+    return `${raw} raw units`;
+  }
+  const digits = BigInt(raw).toString().padStart(decimals + 1, '0');
+  const whole = decimals === 0 ? digits : digits.slice(0, -decimals);
+  const fraction = decimals === 0 ? '' : digits.slice(-decimals).replace(/0+$/, '');
+  return `${whole}${fraction ? `.${fraction}` : ''}${symbol ? ` ${symbol}` : ''}`;
+}
+
 // decode base64 to bytes (e.g. sponsored tx bytes from API)
 export function base64ToBytes(b64: string): Uint8Array {
   const binary = atob(b64);

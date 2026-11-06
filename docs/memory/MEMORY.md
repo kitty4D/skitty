@@ -1,9 +1,13 @@
-# memory
+# project memory
 
-current state of the parts of skitty that bite. fix these when they go stale; wrong memory is worse than none.
+these notes describe the current implementation and keep dated observations separate. if the code changes, update the relevant note. don't turn an old simulation into proof of current network behavior
 
-- [gas modes](gas-modes.md): sponsored vs self-paid gas, when each applies, and how the self-paid planner prices a batch.
-- [sui gas facts](sui-gas-facts.md): verified mainnet behavior of address balances, withdrawals, simulation and rebates. the stuff that made every earlier design wrong.
-- [sponsor trust boundary](sponsor-trust-boundary.md): why `/api/sponsor` validates server-side, and the attacks each gate exists to stop.
-- [sui json-rpc is gone](sui-jsonrpc-removed.md): public fullnodes reject every json-rpc method; everything runs on graphql.
-- [operations](operations.md): vercel env, upstash naming, funding and draining the sponsor wallet.
+- [gas modes](gas-modes.md): sponsorship, voluntary self-payment, gas planning, and wallet feedback
+- [coin cleanup](coin-cleanup.md): keep-token deposits, SUI consolidation, exact balances, and overlapping choices
+- [object cleanup](object-cleanup.md): empty containers, Walrus receipts, kiosk proceeds, and native allowances
+- [sponsor checks](sponsor-trust-boundary.md): what the hot key signs, value bounds, and remaining risks
+- [gas observations](sui-gas-facts.md): rebates, address balances, withdrawals, and verification limits
+- [GraphQL migration](sui-jsonrpc-removed.md): client contracts and removed JSON-RPC paths
+- [operations](operations.md): configuration, sponsor conversion, Redis, and diagnosis
+
+README describes what users can do. AGENTS.md holds the shared agent instructions. CLAUDE.md imports AGENTS.md

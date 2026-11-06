@@ -14,6 +14,7 @@ import {
   SELF_PAY_MAX_GAS_COINS,
 } from './constants';
 import type { CleanupAction } from './types';
+import { selectCleanupGas } from './gasSelection';
 
 // every simulate and execute flow goes through here, sponsored or self-paid. there used
 // to be four copies of this pipeline, and every fix had to land four times.
@@ -23,6 +24,14 @@ import type { CleanupAction } from './types';
  * wallet does, which is exactly what a wallet with no SUI can't do.
  */
 export type GasMode = 'sponsored' | 'self';
+
+export function gasModeForActions(actions: CleanupAction[], requested: GasMode): GasMode {
+  return actions.some(action => action.selfPaidOnly || action.kind === 'withdraw_kiosk') ? 'self' : requested;
+}
+
+export function kioskProceedsMist(actions: CleanupAction[]): number {
+  return actions.reduce((sum, action) => sum + (action.kind === 'withdraw_kiosk' ? Number(action.proceedsMist) : 0), 0);
+}
 
 export interface SponsorResponse {
   sponsoredTxBytes: string;
@@ -152,7 +161,7 @@ function netSuiFor(
 
 export interface SuiHoldings {
   /** the coins a self-paid transaction hands over as its gas payment */
-  coins: { objectId: string; version: string; digest: string }[];
+  coins: { objectId: string; version: string; digest: string; balanceMist: number }[];
   /** what exactly those coins hold, which is what tx.gas starts with */
   coinTotalMist: number;
   addressBalanceMist: number;
@@ -165,7 +174,7 @@ export async function fetchSuiHoldings(owner: string): Promise<SuiHoldings> {
   ]);
   const funded = coinPage.objects.filter((coin) => BigInt(coin.balance) > 0n);
   return {
-    coins: funded.map(({ objectId, version, digest }) => ({ objectId, version, digest })),
+    coins: funded.map(({ objectId, version, digest, balance }) => ({ objectId, version, digest, balanceMist: Number(balance) })),
     coinTotalMist: Number(funded.reduce((sum, coin) => sum + BigInt(coin.balance), 0n)),
     addressBalanceMist: Number(balance.balance.addressBalance ?? 0),
   };
@@ -187,9 +196,9 @@ export function selfPaidGasSource(holdings: SuiHoldings): {
 
 function notEnoughSuiForGas(availableMist: number, neededMist: number): string {
   if (availableMist <= 0) {
-    return "This wallet has no SUI to pay gas, and the gas sponsor is out of SUI. It can't run anything until the sponsor is topped up.";
+    return "This wallet has no SUI to pay gas. This self-paid selection needs SUI in your wallet before it can run.";
   }
-  return `This wallet needs about ${formatSui(neededMist)} SUI for gas but only has ${formatSui(availableMist)}, and the gas sponsor is out of SUI.`;
+  return `This self-paid selection needs about ${formatSui(neededMist)} SUI for gas but this wallet only has ${formatSui(availableMist)}.`;
 }
 
 interface SelfPaidPlan {
@@ -200,40 +209,50 @@ interface SelfPaidPlan {
 
 async function planSelfPaid(actions: CleanupAction[], sender: string): Promise<SelfPaidPlan> {
   const holdings = await fetchSuiHoldings(sender);
-  const { source, availableMist } = selfPaidGasSource(holdings);
-  if (availableMist < SELF_PAY_MIN_GAS_BUDGET_MIST) {
-    throw new Error(notEnoughSuiForGas(availableMist, SELF_PAY_MIN_GAS_BUDGET_MIST));
-  }
+  let budgetMist = SELF_PAY_MIN_GAS_BUDGET_MIST;
+  let grossGasMist = 0;
+  let gas = selectCleanupGas(actions, holdings, budgetMist);
+  const paymentKey = (selection: typeof gas) =>
+    `${selection.source}:${selection.coins.map((coin) => coin.objectId).join(',')}`;
 
-  // 1) measure. simulation never checks an empty payment against the payer, so this
-  //    prices the batch before we've committed to a budget. the fee's already in at
-  //    about its final size, so its commands get priced along with everything else.
-  const draft = buildBatchTransaction(actions, {
-    sponsoredGas: false,
-    senderAddress: sender,
-    selfPaidFee: { source, maxMist: availableMist - SELF_PAY_MIN_GAS_BUDGET_MIST },
-  });
-  draft.tx.setSender(sender);
-  draft.tx.setGasBudget(SELF_PAY_DRAFT_GAS_BUDGET_MIST);
-  draft.tx.setGasPayment([]);
-  const draftResult = await graphQLClient.simulateTransaction({
-    transaction: await draft.tx.build({ client: graphQLClient }),
-    include: { effects: true },
-  });
-  const draftTx =
-    draftResult.$kind === 'Transaction' ? draftResult.Transaction : draftResult.FailedTransaction;
-  if (draftResult.$kind !== 'Transaction' || !draftTx?.status?.success || !draftTx.effects?.gasUsed) {
-    throw new Error(
-      executionErrorMessage(draftTx?.status?.error) ?? 'Transaction would fail on-chain.'
-    );
-  }
-  const grossGasMist = grossGasCost(draftTx.effects.gasUsed);
-  const budgetMist = Math.max(
-    SELF_PAY_MIN_GAS_BUDGET_MIST,
-    Math.ceil(grossGasMist * SELF_PAY_GAS_BUDGET_MARGIN)
-  );
-  if (availableMist < budgetMist) {
-    throw new Error(notEnoughSuiForGas(availableMist, budgetMist));
+  // a larger budget can reserve more selected SUI coins or switch the gas source.
+  // that changes which actions fit, so reprice that plan before asking anyone to sign.
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (gas.availableMist < budgetMist) {
+      throw new Error(notEnoughSuiForGas(gas.availableMist, budgetMist));
+    }
+    const draft = buildBatchTransaction(actions, {
+      sponsoredGas: false,
+      senderAddress: sender,
+      selfPaidFee: { source: gas.source, maxMist: gas.availableMist - budgetMist },
+      gasCoinIds: gas.coins.map((coin) => coin.objectId),
+      mergeSuiIntoGas: gas.source === 'gasCoin',
+    });
+    if (!draft.includedActions.length) {
+      throw new Error('The selected SUI coins are needed for gas. Keep a separate gas coin or use a funded address balance.');
+    }
+    draft.tx.setSender(sender);
+    draft.tx.setGasBudget(SELF_PAY_DRAFT_GAS_BUDGET_MIST);
+    draft.tx.setGasPayment([]);
+    const draftResult = await graphQLClient.simulateTransaction({
+      transaction: await draft.tx.build({ client: graphQLClient }),
+      include: { effects: true },
+    });
+    const draftTx = draftResult.$kind === 'Transaction' ? draftResult.Transaction : draftResult.FailedTransaction;
+    if (draftResult.$kind !== 'Transaction' || !draftTx?.status?.success || !draftTx.effects?.gasUsed) {
+      throw new Error(executionErrorMessage(draftTx?.status?.error) ?? 'Transaction would fail on-chain.');
+    }
+    grossGasMist = grossGasCost(draftTx.effects.gasUsed);
+    const nextBudget = Math.max(budgetMist, Math.ceil(grossGasMist * SELF_PAY_GAS_BUDGET_MARGIN));
+    const nextGas = selectCleanupGas(actions, holdings, nextBudget);
+    const stable = paymentKey(nextGas) === paymentKey(gas);
+    budgetMist = nextBudget;
+    gas = nextGas;
+    if (gas.availableMist < budgetMist) {
+      throw new Error(notEnoughSuiForGas(gas.availableMist, budgetMist));
+    }
+    if (stable) break;
+    if (attempt === 5) throw new Error('Gas planning changed repeatedly. Try a smaller batch.');
   }
 
   // 2) the real one, with the fee capped at whatever's left after the budget
@@ -241,14 +260,19 @@ async function planSelfPaid(actions: CleanupAction[], sender: string): Promise<S
     sponsoredGas: false,
     senderAddress: sender,
     estimatedGasMist: grossGasMist,
-    selfPaidFee: { source, maxMist: availableMist - budgetMist },
+    selfPaidFee: { source: gas.source, maxMist: gas.availableMist - budgetMist },
+    gasCoinIds: gas.coins.map((coin) => coin.objectId),
+    mergeSuiIntoGas: gas.source === 'gasCoin',
   });
+  if (!build.includedActions.length) {
+    throw new Error('The selected SUI coins are needed for gas. Keep a separate gas coin or use a funded address balance.');
+  }
   build.tx.setSender(sender);
   build.tx.setGasBudget(budgetMist);
   // coins get pinned so the fee cap matches exactly what tx.gas holds. the address
   // balance route is left to the resolver, which checks budget + fee against the real
   // balance before it hands back an empty payment.
-  if (source === 'gasCoin') build.tx.setGasPayment(holdings.coins);
+  if (gas.source === 'gasCoin') build.tx.setGasPayment(gas.coins);
   const bytes = await build.tx.build({ client: graphQLClient });
   return { build, bytes };
 }
@@ -277,6 +301,7 @@ export async function simulateActions(
   senderAddress: string,
   gasMode: GasMode = 'sponsored'
 ): Promise<SimulationOutcome> {
+  gasMode = gasModeForActions(actions, gasMode);
   let build: BuildBatchResult;
   let txBytes: Uint8Array;
   if (gasMode === 'self') {
@@ -313,7 +338,7 @@ export async function simulateActions(
   }
   // display uses the net figure (what the transaction costs after the rebate lands)
   const gasCostMist = netGasCost(effects.gasUsed);
-  const netGainMist = build.userRebateMist - build.gasMist - build.feeMist;
+  const netGainMist = kioskProceedsMist(build.includedActions) + build.userRebateMist - build.gasMist - build.feeMist;
   const netInflowMist = netSuiFor(txResult?.balanceChanges, senderAddress);
 
   return {
@@ -433,6 +458,7 @@ export async function executeActions(
   signTransaction: SignTransaction,
   gasMode: GasMode = 'sponsored'
 ): Promise<ExecuteOutcome> {
+  gasMode = gasModeForActions(actions, gasMode);
   if (gasMode === 'self') return executeSelfPaid(actions, senderAddress, signTransaction);
 
   // 1) draft: sponsor without a signature purely to measure gas. The build derives its
