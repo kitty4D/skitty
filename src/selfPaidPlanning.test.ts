@@ -70,6 +70,51 @@ it('allows consolidation performed entirely by gas smashing', async () => {
   expect(snapshots[1].commands).toHaveLength(0);
 });
 
+it('uses final gas effects after a draft fee is waived, rather than the draft gas estimate', async () => {
+  vi.spyOn(graphQLClient, 'listCoins').mockResolvedValue({ objects: [] } as never);
+  vi.spyOn(graphQLClient, 'getBalance').mockResolvedValue({ balance: { addressBalance: '100000000' } } as never);
+  vi.spyOn(Transaction.prototype, 'build').mockResolvedValue(new Uint8Array([1]));
+  vi.spyOn(graphQLClient, 'simulateTransaction')
+    .mockResolvedValueOnce(simulation(2000000))
+    .mockResolvedValueOnce({
+      $kind: 'Transaction', Transaction: {
+        status: { success: true }, balanceChanges: [],
+        effects: { gasUsed: { computationCost: '100000', storageCost: '0', storageRebate: '987901' } },
+      },
+    } as never);
+  const result = await simulateActions([deposit('0xa')], SENDER, 'self');
+  expect(result.build.feeMist).toBe(0);
+  expect(result.build.gasMist).toBe(2000000);
+  expect(result.netGainMist).toBe(887901);
+});
+
+it('prefers the sender balance change, including zero, over any calculated recovery', async () => {
+  vi.spyOn(graphQLClient, 'listCoins').mockResolvedValue({ objects: [] } as never);
+  vi.spyOn(graphQLClient, 'getBalance').mockResolvedValue({ balance: { addressBalance: '100000000' } } as never);
+  vi.spyOn(Transaction.prototype, 'build').mockResolvedValue(new Uint8Array([1]));
+  const response = simulation(100000) as unknown as { Transaction: { balanceChanges: unknown[] } };
+  response.Transaction.balanceChanges = [{ address: SENDER, coinType: '0x2::sui::SUI', amount: '0' }];
+  vi.spyOn(graphQLClient, 'simulateTransaction').mockResolvedValue(response as never);
+  const result = await simulateActions([deposit('0xa')], SENDER, 'self');
+  expect(result.netGainMist).toBe(0);
+});
+
+it('measures sponsored gas before quoting the sender payout and never uses the sponsor rebate as recovery', async () => {
+  vi.spyOn(Transaction.prototype, 'build').mockResolvedValue(new Uint8Array([1]));
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+    ok: true, json: async () => ({ sponsoredTxBytes: 'AQ==', sponsorAddress: '0x2' }),
+  } as Response);
+  vi.spyOn(graphQLClient, 'simulateTransaction').mockResolvedValue(simulation(200000));
+  const result = await simulateActions([deposit('0xa')], SENDER, 'sponsored');
+  expect(result.build.gasMist).toBe(200000);
+  expect(result.netGainMist).toBe(990000 - 200000 - 136900);
+  expect(result.netGainMist).toBe(result.build.userShareMist);
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  for (const [, options] of fetchMock.mock.calls) {
+    expect(JSON.parse(String(options?.body)).simulateOnly).toBe(true);
+  }
+});
+
 it('checks real funding for forced-self kiosk withdrawal even with a funded sponsor requested', async () => {
   vi.spyOn(graphQLClient, 'listCoins').mockResolvedValue({objects:[]} as never);
   vi.spyOn(graphQLClient, 'getBalance').mockResolvedValue({balance:{addressBalance:'0'}} as never);

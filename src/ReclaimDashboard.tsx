@@ -191,6 +191,7 @@ export function ReclaimDashboard() {
     error?: string;
     /** who paid gas in this simulation; its numbers are wrong for the other mode */
     gasMode?: GasMode;
+    forQueue?: boolean;
   } | null>(null);
   const [simulationModal, setSimulationModal] = React.useState<{
     /** net gain from formula (rebate - gas - fee); used when balance changes unavailable */
@@ -359,10 +360,10 @@ export function ReclaimDashboard() {
           gasCostMist: outcome.gasCostMist,
           error,
           gasMode: outcome.gasMode,
+          forQueue: !forKey,
         });
         const expectedInflowMist =
           outcome.netInflowMist ??
-          (outcome.gasCostMist <= 0 ? -outcome.gasCostMist : undefined) ??
           outcome.netGainMist;
         if (forKey) {
           setSimulationModal({
@@ -472,7 +473,7 @@ export function ReclaimDashboard() {
     simulationEpochRef.current += 1;
     setSimulating(false);
     setDryRunResult(null);
-  }, [selectedKeys, selectionGasMode]);
+  }, [selectedKeys, selectedActionList, selectionGasMode]);
 
   const feedSkitty = React.useCallback(async () => {
     const walletEpoch = walletEpochRef.current;
@@ -979,7 +980,7 @@ export function ReclaimDashboard() {
               userShareMist={userShareMist}
               droppedActionCount={droppedActionCount}
               dryRunResult={
-                dryRunResult && (dryRunResult.error || dryRunResult.gasMode === selectionGasMode)
+                dryRunResult && (dryRunResult.error || (dryRunResult.forQueue && dryRunResult.gasMode === selectionGasMode))
                   ? dryRunResult
                   : null
               }

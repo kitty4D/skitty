@@ -45,7 +45,7 @@ export function FloatingCart({
   proceedsMist?: number;
   /** actions the batch cap left out of this transaction */
   droppedActionCount?: number;
-  dryRunResult: { netGainMist: number; gasCostMist: number; error?: string } | null;
+  dryRunResult: { netGainMist: number; gasCostMist: number; error?: string; forQueue?: boolean } | null;
   executeError: string | null;
   executeNotice?: string | null;
   runDryRun: () => void;
@@ -66,6 +66,8 @@ export function FloatingCart({
 }) {
   const forcedSelf = selectedActionList.some((a) => a.selfPaidOnly || a.kind === 'withdraw_kiosk');
   if (forcedSelf) gasMode = 'self';
+  const measured = dryRunResult?.forQueue && !dryRunResult.error;
+  const displayedShareMist = measured ? dryRunResult.netGainMist : userShareMist;
   return (
     <div className="relative pointer-events-auto w-full max-w-lg">
       <AnimatePresence mode="wait">
@@ -132,10 +134,10 @@ export function FloatingCart({
                 <div className="flex justify-between items-start gap-4">
                   <div>
                     <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">
-                      {userShareMist < 0 ? 'NET COST (EST.)' : 'YOU RECEIVE (EST.)'}
+                      {displayedShareMist < 0 ? 'NET COST' : 'YOU RECEIVE'} ({measured ? 'SIMULATED' : 'EST.'})
                     </p>
-                    <p className={`text-4xl font-black tracking-tighter leading-none mt-1 ${userShareMist < 0 ? 'text-red-400' : 'text-white'}`}>
-                      {formatSui(Math.abs(userShareMist))} SUI
+                    <p className={`text-4xl font-black tracking-tighter leading-none mt-1 ${displayedShareMist < 0 ? 'text-red-400' : 'text-white'}`}>
+                      {formatSui(Math.abs(displayedShareMist))} SUI
                     </p>
                     {gasMode === 'self' && (
                       <p className="text-[10px] font-black text-amber-400 uppercase tracking-widest leading-snug mt-2 max-w-[14rem]">
@@ -144,6 +146,7 @@ export function FloatingCart({
                     )}
                   </div>
                   <div className="text-right space-y-1 shrink-0">
+                    {measured && <p className="text-[9px] text-skitty-secondary">rough breakdown before simulation</p>}
                     <div>
                       <p className="text-[10px] font-black text-skitty-secondary uppercase tracking-widest">Storage rebate</p>
                       <p className="text-xs font-black text-white tracking-tighter">{formatSui(storageRebateMist)} SUI</p>
@@ -187,7 +190,7 @@ export function FloatingCart({
                   ) : (
                     <div className="grid grid-cols-2 gap-4">
                       <div>
-                        <p className="text-[8px] font-black text-skitty-accent uppercase tracking-widest">EST. GAS</p>
+                        <p className="text-[8px] font-black text-skitty-accent uppercase tracking-widest">GAS PAYER NET COST</p>
                         <p className="text-sm font-black text-white tracking-tighter">{dryRunResult.gasCostMist >= 0 ? '-' : '+'}{formatSui(Math.abs(dryRunResult.gasCostMist))} SUI</p>
                       </div>
                       <div>

@@ -279,6 +279,23 @@ async function planSelfPaid(actions: CleanupAction[], sender: string): Promise<S
 
 // ---- simulate ----
 
+async function planSponsored(actions: CleanupAction[], sender: string) {
+  const draft = await buildKindBytes(actions, sender, null);
+  const response = await requestSponsorship(draft.kindBytes, sender, true);
+  const result = await graphQLClient.simulateTransaction({
+    transaction: base64ToBytes(response.sponsoredTxBytes),
+    include: { effects: true },
+  });
+  if (result.$kind !== 'Transaction' || !result.Transaction.status?.success) {
+    const tx = result.$kind === 'Transaction' ? result.Transaction : result.FailedTransaction;
+    throw new Error(executionErrorMessage(tx?.status?.error) ?? 'Transaction would fail on-chain.');
+  }
+  if (!result.Transaction.effects?.gasUsed) throw new Error('Dry run failed or no gas data.');
+  return buildKindBytes(actions, sender, Math.max(
+    grossGasCost(result.Transaction.effects.gasUsed), draft.build.gasMist
+  ));
+}
+
 export interface SimulationOutcome {
   build: BuildBatchResult;
   gasMode: GasMode;
@@ -307,8 +324,8 @@ export async function simulateActions(
   if (gasMode === 'self') {
     ({ build, bytes: txBytes } = await planSelfPaid(actions, senderAddress));
   } else {
-    // gas comes from the build's own estimate over the actions that fit under the cap
-    const kind = await buildKindBytes(actions, senderAddress, null);
+    // use execution's measured payout plan before asking for the final simulation.
+    const kind = await planSponsored(actions, senderAddress);
     build = kind.build;
     const { sponsoredTxBytes } = await requestSponsorship(kind.kindBytes, senderAddress, true);
     txBytes = base64ToBytes(sponsoredTxBytes);
@@ -338,8 +355,12 @@ export async function simulateActions(
   }
   // display uses the net figure (what the transaction costs after the rebate lands)
   const gasCostMist = netGasCost(effects.gasUsed);
-  const netGainMist = kioskProceedsMist(build.includedActions) + build.userRebateMist - build.gasMist - build.feeMist;
   const netInflowMist = netSuiFor(txResult?.balanceChanges, senderAddress);
+  // final effects include gas smashing and any fee commands that survived planning.
+  // the sponsor's gas rebate isn't the sender's payout.
+  const netGainMist = netInflowMist ?? (gasMode === 'sponsored'
+    ? build.userShareMist + kioskProceedsMist(build.includedActions)
+    : kioskProceedsMist(build.includedActions) - gasCostMist - build.feeMist);
 
   return {
     build,
@@ -448,8 +469,8 @@ async function executeSelfPaid(
 }
 
 /**
- * sponsored: simulate for real gas, rebuild so the sponsor recoups exactly what it
- * spends, get the sponsor signature, have the user sign, and submit. self-paid: measure,
+ * sponsored: measure gas, rebuild with the conservative recoup allowance, get the
+ * sponsor signature, have the user sign, and submit. self-paid: measure,
  * pin the budget, have the user sign, and submit.
  */
 export async function executeActions(
@@ -461,41 +482,9 @@ export async function executeActions(
   gasMode = gasModeForActions(actions, gasMode);
   if (gasMode === 'self') return executeSelfPaid(actions, senderAddress, signTransaction);
 
-  // 1) draft: sponsor without a signature purely to measure gas. The build derives its
-  //    own estimate from the actions that fit under the batch cap.
-  let draft;
-  try {
-    draft = await buildKindBytes(actions, senderAddress, null);
-  } catch (error) {
-    throw new Error(friendlyBuildError(error));
-  }
-  const { sponsoredTxBytes: draftBytes } = await requestSponsorship(
-    draft.kindBytes,
-    senderAddress,
-    true
-  );
-  const simResult = await graphQLClient.simulateTransaction({
-    transaction: base64ToBytes(draftBytes),
-    include: { effects: true },
-  });
-  const simTx =
-    simResult.$kind === 'Transaction' ? simResult.Transaction : simResult.FailedTransaction;
-  if (!simTx?.effects?.gasUsed) throw new Error('Dry run failed or no gas data.');
-  if (simResult.$kind !== 'Transaction' || !simTx.status?.success) {
-    throw new Error(
-      executionErrorMessage(simTx.status?.error) ?? 'Transaction would fail on-chain.'
-    );
-  }
-  // Recoup the GROSS cost the gas coin fronts. The storage rebate is already returned
-  // to the user through userRebateMist, so netting it off here would have the sponsor
-  // pay for the transaction twice.
-  const gasRecoupMist = Math.max(grossGasCost(simTx.effects.gasUsed), draft.build.gasMist);
-
-  // 2) rebuild with the real gas figure. buildBatchTransaction throws when the
-  //    rebate cannot cover gas plus fee, which is the check we want before signing.
   let final;
   try {
-    final = await buildKindBytes(actions, senderAddress, gasRecoupMist);
+    final = await planSponsored(actions, senderAddress);
   } catch (error) {
     throw new Error(friendlyBuildError(error));
   }

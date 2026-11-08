@@ -44,6 +44,8 @@ the fee is waived when `userRebate - gas - fee <= 0`. storage accounting uses on
 - disconnecting or changing wallets clears feedback, simulations, explanations, and pending confirmations. epochs reject late responses from the old wallet session
 - an active execution stays locked until it settles. a wallet switch doesn't cancel a transaction already submitted
 - finality timeout is reported as pending, not as proof of failure. an onchain abort isn't reported as success
-- known quote limit: if a fee included in the measuring draft is waived in the final build, `build.gasMist` can remain conservatively high. a november 6 read-only SUI deposit had positive final simulated inflow despite negative fallback `netGainMist`. prefer final balance changes for that simulation; don't describe the rough card estimate as a measured profit
+- scan estimates still use fixed per-action gas allowances. queue simulation replaces the headline with measured net recovery and labels the remaining breakdown as rough. individual card simulations don't price the queue. selection, refreshed actions, or payer changes invalidate queue results
+- simulation prefers sender SUI balance changes, including zero. without them, self-paid recovery uses final simulated storage rebate minus computation/storage costs and the actual built fee, plus kiosk proceeds. sponsored recovery uses the explicit built sender payout, never the sponsor's gas rebate. this fixes the stale draft-gas fallback when final planning waives a fee
+- sponsored simulation and execution share `planSponsored`: measure the draft, recoup the greater of measured gross gas and the existing conservative allowance, then rebuild the payout. simulation requests remain unsigned. this aligns the quote path without weakening the sponsor's funding checks
 
 related: [coin cleanup](coin-cleanup.md), [object cleanup](object-cleanup.md), [gas observations](sui-gas-facts.md)

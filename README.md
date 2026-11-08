@@ -66,6 +66,8 @@ gas is measured before signing, with a budget of at least 1.5 times gross cost a
 
 simulate before signing. a small cleanup can cost more than it recovers
 
+scan results use rough gas allowances. simulating the queue replaces its headline with the sender's simulated net SUI change after gas and fees. sponsored simulation measures gas and rebuilds the payout using the same planning path as execution. changing the selection or gas mode clears the result. the network can still change before execution
+
 the final transaction is checked before the wallet prompt. shared state can still change before execution, and a failed submitted transaction can cost gas. review the wallet's transaction details
 
 an empty gas-payment simulation doesn't verify its payer can afford gas. self-paid planning checks holdings separately
