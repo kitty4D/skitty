@@ -9,6 +9,12 @@ const coin = (id: number, coinType = type, balance: unknown = '7', rebate = '100
 });
 
 describe('coin actions', () => {
+  it('quotes effective keep-token cost after crediting the gas-object rebate', () => {
+    const [action] = generateCoinActions([coin(1, type, '1', '1398400')], new Set());
+    // the old 500-mist allowance produced 1,192,476 mist for this same rebate.
+    expect(action.estimatedGasMist).toBe(100000);
+    expect(action.netGainMist).toBe(1092976);
+  });
   it('never groups distinct case-sensitive Move token types together', () => {
     const actions = generateCoinActions([coin(1, type), coin(2, '0x2::coin::Coin<0xa::token::Token>')], new Set());
     expect(actions.filter((a) => a.kind === 'keep_tokens')).toHaveLength(2);

@@ -188,6 +188,7 @@ export function ReclaimDashboard() {
   const [dryRunResult, setDryRunResult] = React.useState<{
     netGainMist: number;
     gasCostMist: number;
+    sponsorNetMist?: number | null;
     error?: string;
     /** who paid gas in this simulation; its numbers are wrong for the other mode */
     gasMode?: GasMode;
@@ -199,6 +200,8 @@ export function ReclaimDashboard() {
     /** actual SUI balance change for sender from simulation (preferred for display) */
     netInflowMist?: number;
     gasCostMist?: number;
+    sponsorNetMist?: number | null;
+    gasMode?: GasMode;
     error?: string;
   } | null>(null);
   /** per-action simulated net inflow (from balance changes); card shows this when set so it matches wallet */
@@ -358,6 +361,7 @@ export function ReclaimDashboard() {
         setDryRunResult({
           netGainMist: outcome.netGainMist,
           gasCostMist: outcome.gasCostMist,
+          sponsorNetMist: outcome.sponsorNetMist,
           error,
           gasMode: outcome.gasMode,
           forQueue: !forKey,
@@ -370,6 +374,8 @@ export function ReclaimDashboard() {
             netGainMist: outcome.netGainMist,
             netInflowMist: expectedInflowMist,
             gasCostMist: outcome.gasCostMist,
+            sponsorNetMist: outcome.sponsorNetMist,
+            gasMode: outcome.gasMode,
             error,
           });
           if (!error) {
@@ -1231,7 +1237,7 @@ export function ReclaimDashboard() {
               ) : (
                 <div className="space-y-2 mb-4">
                   <p className="text-xs font-black text-skitty-accent uppercase tracking-widest">
-                    Est. net inflow
+                    your net recovery (simulated)
                   </p>
                   <p className="text-skitty-accent font-black text-lg">
                     {simulationModal.netInflowMist !== undefined
@@ -1239,9 +1245,14 @@ export function ReclaimDashboard() {
                       : formatSui(simulationModal.netGainMist ?? 0) + ' SUI'}
                   </p>
                   <p className="text-xs font-black text-skitty-secondary uppercase tracking-widest mt-3">
-                    Gas cost (est.)
+                    storage rebate minus gas
                   </p>
                   <p className="text-white font-black">{(simulationModal.gasCostMist ?? 0) >= 0 ? '-' : '+'}{formatSui(Math.abs(simulationModal.gasCostMist ?? 0))} SUI</p>
+                  {simulationModal.gasMode === 'sponsored' && <div className="pt-2">
+                    <p className="text-xs font-black text-skitty-secondary uppercase tracking-widest">sponsor net balance change (simulated)</p>
+                    <p className="text-white font-black">{simulationModal.sponsorNetMist == null ? 'unavailable' : `${simulationModal.sponsorNetMist > 0 ? '+' : ''}${formatSui(simulationModal.sponsorNetMist)} SUI`}</p>
+                    <p className="text-[10px] text-skitty-secondary">includes gas, storage rebates, and your payout</p>
+                  </div>}
                   <p className="text-[9px] font-mono text-skitty-secondary/80 mt-2">
                     Actual amounts at execution may differ. Review in your wallet before approving.
                   </p>

@@ -29,7 +29,8 @@ export interface BuildBatchOptions {
   /** required when sponsoredGas: where the user's share is sent */
   senderAddress?: string;
   /**
-   * Gas (mist) the sponsor fronts and recoups from the rebate. Leave undefined to
+   * effective gas (mist) recouped after crediting non-user-object rebates in sponsored
+   * mode; measured gross gas for self-paid fee planning. leave undefined to
    * estimate it from the actions that actually fit in the batch - passing a figure
    * summed over the whole selection charges the user for work the cap dropped.
    */
@@ -62,7 +63,7 @@ export interface BuildBatchResult {
   userShareMist: number;
   /** actions the batch cap forced us to leave out */
   droppedActionCount: number;
-  /** gas (mist) the build actually charged, derived from includedActions */
+  /** quoted effective sponsored cost, or self-paid planning cost */
   gasMist: number;
 }
 
@@ -380,8 +381,8 @@ export function buildBatchTransaction(
     // the gas coin, which the sponsor owns - splitting them off and transferring them to
     // FEE_RECIPIENT (the sponsor itself) was a round trip that created a second coin
     // object every run, costing ~988,000 mist of extra storage and steadily draining and
-    // fragmenting the gas coin. Leaving them in place makes the gas coin self-funding:
-    // its net change per batch becomes rebate - gross gas - userShare, i.e. the fee.
+    // fragmenting the gas coin. measured payout planning leaves only the fee and app
+    // allowance after accounting for the full gas effects, including gas-object rebate.
     if (userShareMist > 0) {
       const [userCoin] = tx.splitCoins(tx.gas, [userShareMist]);
       // paying as a coin would replace the wrapper we just removed with another one.

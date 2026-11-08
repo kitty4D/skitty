@@ -1,7 +1,7 @@
 // 1 SUI = 10^9 MIST, use for display conversion
 export const MIST_PER_SUI = 1_000_000_000;
 
-// user gets 99% of storage rebate; 1% burned by protocol
+// app quote keeps a 1% allowance; this isn't the protocol's nonrefundable storage fee.
 export const REBATE_MULTIPLIER = 0.99;
 
 // max coin merges per batch to stay under protocol limits
@@ -30,7 +30,8 @@ export const SELF_PAY_MAX_GAS_COINS = 50;
 // estimated gas (mist) per action type for net-gain before dry run
 export const ESTIMATED_GAS = {
   mergeCoins: 500,
-  keepTokens: 500,
+  // rough effective cost after the gas-object rebate, not the gross budget or a quote.
+  keepTokens: 100_000,
   destroyZero: 300,
   closeKiosk: 2000,
   burn: 1_200_000,

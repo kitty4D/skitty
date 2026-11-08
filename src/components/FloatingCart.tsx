@@ -45,7 +45,7 @@ export function FloatingCart({
   proceedsMist?: number;
   /** actions the batch cap left out of this transaction */
   droppedActionCount?: number;
-  dryRunResult: { netGainMist: number; gasCostMist: number; error?: string; forQueue?: boolean } | null;
+  dryRunResult: { netGainMist: number; gasCostMist: number; sponsorNetMist?: number | null; error?: string; forQueue?: boolean } | null;
   executeError: string | null;
   executeNotice?: string | null;
   runDryRun: () => void;
@@ -153,7 +153,7 @@ export function FloatingCart({
                     </div>
                     {proceedsMist > 0 && <div><p className="text-[10px] text-skitty-secondary">kiosk proceeds (no fee)</p><p className="text-xs text-white">{formatSui(proceedsMist)} SUI</p></div>}
                     <div>
-                      <p className="text-[10px] font-black text-red-500 uppercase tracking-widest">Protocol burn (1%)</p>
+                      <p className="text-[10px] font-black text-red-500 uppercase tracking-widest">{gasMode === 'sponsored' ? 'Sponsor allowance (1%)' : 'Rebate allowance (1%, est.)'}</p>
                       <p className="text-xs font-black text-red-500/80 tracking-tighter">-{formatSui(burnedMist)} SUI</p>
                     </div>
                     <div>
@@ -190,13 +190,18 @@ export function FloatingCart({
                   ) : (
                     <div className="grid grid-cols-2 gap-4">
                       <div>
-                        <p className="text-[8px] font-black text-skitty-accent uppercase tracking-widest">GAS PAYER NET COST</p>
+                        <p className="text-[8px] font-black text-skitty-accent uppercase tracking-widest">storage rebate minus gas</p>
                         <p className="text-sm font-black text-white tracking-tighter">{dryRunResult.gasCostMist >= 0 ? '-' : '+'}{formatSui(Math.abs(dryRunResult.gasCostMist))} SUI</p>
                       </div>
                       <div>
-                        <p className="text-[8px] font-black text-skitty-accent uppercase tracking-widest">NET YIELD</p>
+                        <p className="text-[8px] font-black text-skitty-accent uppercase tracking-widest">your net recovery</p>
                         <p className="text-sm font-black text-white tracking-tighter">{formatSui(dryRunResult.netGainMist)} SUI</p>
                       </div>
+                      {gasMode === 'sponsored' && <div className="col-span-2 border-t border-skitty-accent/30 pt-3">
+                        <p className="text-[8px] font-black text-skitty-accent uppercase tracking-widest">sponsor net balance change (simulated)</p>
+                        <p className="text-sm font-black text-white">{dryRunResult.sponsorNetMist == null ? 'unavailable' : `${dryRunResult.sponsorNetMist > 0 ? '+' : ''}${formatSui(dryRunResult.sponsorNetMist)} SUI`}</p>
+                        <p className="text-[10px] text-skitty-secondary mt-1">includes gas, storage rebates, and your payout</p>
+                      </div>}
                     </div>
                   )}
                   <Button

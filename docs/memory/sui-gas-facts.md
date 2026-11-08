@@ -10,6 +10,8 @@ a split during execution uses existing gas-coin funds. the earlier simulations f
 
 the builder applies `REBATE_MULTIPLIER = 0.99` to its planned storage rebate, then subtracts gas and the service fee. that's an app quote. don't label every reported `storageRebate` value as a gross deposit or infer the exact current protocol burn from that multiplier. simulated effects report their own storage rebate and nonrefundable fee
 
+gas effects also include rebate from rewriting the sponsor's gas coin. sponsored payout planning therefore recoups `gross gas - effects rebate + included object rebates`, not gross gas alone. it verifies that full effects less payout and the sponsor's balance change both equal the service fee plus app allowance. budget sizing still uses gross costs. see the november 8 reconciliation in [gas modes](gas-modes.md)
+
 ## address balances and withdrawals
 
 `getBalance` separates aggregate balance, coin-object balance, and address balance. the current app can use address-balance gas for self-paid transactions and sponsor-owned conversion

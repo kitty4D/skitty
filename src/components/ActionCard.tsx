@@ -202,7 +202,7 @@ export function ActionCard({
         <div className="shrink-0 flex flex-col gap-2 items-end min-w-[7rem]">
           <div className="text-right space-y-0.5">
             <p className="text-[10px] font-black text-skitty-secondary/40 tracking-widest">
-              EST. NET YIELD
+              {simulatedNetInflowMist === undefined ? 'rough net recovery' : 'your net recovery (simulated)'}
             </p>
             <p className="text-sm font-black text-white leading-none tracking-tighter">
               {(() => {

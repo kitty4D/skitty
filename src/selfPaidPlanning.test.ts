@@ -97,22 +97,120 @@ it('prefers the sender balance change, including zero, over any calculated recov
   vi.spyOn(graphQLClient, 'simulateTransaction').mockResolvedValue(response as never);
   const result = await simulateActions([deposit('0xa')], SENDER, 'self');
   expect(result.netGainMist).toBe(0);
+  expect(result.sponsorNetMist).toBeNull();
 });
 
-it('measures sponsored gas before quoting the sender payout and never uses the sponsor rebate as recovery', async () => {
+it('measures sponsored gas before quoting the sender payout and retains only fee plus allowance', async () => {
   vi.spyOn(Transaction.prototype, 'build').mockResolvedValue(new Uint8Array([1]));
   const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
     ok: true, json: async () => ({ sponsoredTxBytes: 'AQ==', sponsorAddress: '0x2' }),
   } as Response);
-  vi.spyOn(graphQLClient, 'simulateTransaction').mockResolvedValue(simulation(200000));
+  vi.spyOn(graphQLClient, 'simulateTransaction').mockResolvedValue({
+    $kind: 'Transaction', Transaction: { status: { success: true },
+      effects: { gasUsed: { computationCost: '200000', storageCost: '0', storageRebate: '1000000' } },
+      balanceChanges: [{ address: '0x2', coinType: '0x2::sui::SUI', amount: '146900' }],
+    },
+  } as never);
   const result = await simulateActions([deposit('0xa')], SENDER, 'sponsored');
   expect(result.build.gasMist).toBe(200000);
   expect(result.netGainMist).toBe(990000 - 200000 - 136900);
   expect(result.netGainMist).toBe(result.build.userShareMist);
-  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(result.sponsorNetMist).toBe(146900);
+  expect(fetchMock).toHaveBeenCalledTimes(3);
   for (const [, options] of fetchMock.mock.calls) {
     expect(JSON.parse(String(options?.body)).simulateOnly).toBe(true);
   }
+});
+
+it.each([123456, 0, -123456, 146901, undefined])('rejects undisclosed or unverified sponsor retention of %s', async (net) => {
+  vi.spyOn(Transaction.prototype, 'build').mockResolvedValue(new Uint8Array([1]));
+  const sponsor = `0x${'2'.repeat(64)}`;
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+    ok: true, json: async () => ({ sponsoredTxBytes: 'AQ==', sponsorAddress: sponsor }),
+  } as Response);
+  const response = { $kind: 'Transaction', Transaction: {
+    status: { success: true }, balanceChanges: [] as unknown[],
+    effects: { gasUsed: { computationCost: '200000', storageCost: '0', storageRebate: '1000000' } },
+  } };
+  response.Transaction.balanceChanges = [
+    { address: sponsor, coinType: '0x2::sui::SUI', amount: String(net) },
+    { address: SENDER, coinType: '0x2::sui::SUI', amount: '653100' },
+    { address: sponsor, coinType: '0xabc::other::TOKEN', amount: '999999' },
+  ];
+  vi.spyOn(graphQLClient, 'simulateTransaction').mockResolvedValue(response as never);
+  await expect(simulateActions([deposit('0xa')], SENDER, 'sponsored')).rejects.toThrow(/could not be verified/);
+});
+
+it('credits the gas-object rebate from the reported mainnet transaction to the user payout', async () => {
+  vi.spyOn(Transaction.prototype, 'build').mockResolvedValue(new Uint8Array([1]));
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+    ok: true, json: async () => ({ sponsoredTxBytes: 'AQ==', sponsorAddress: '0x2' }),
+  } as Response);
+  vi.spyOn(graphQLClient, 'simulateTransaction').mockResolvedValue({
+    $kind: 'Transaction', Transaction: { status: { success: true },
+      effects: { gasUsed: { computationCost: '100000', storageCost: '988000', storageRebate: '3602040' } },
+      balanceChanges: [{ address: '0x2', coinType: '0x2::sui::SUI', amount: '384055' }],
+    },
+  } as never);
+  const action = { ...deposit('0xa'), storageRebateTotal: '2614400', objectStorageRebates: ['2614400'] };
+  const result = await simulateActions([action], SENDER, 'sponsored');
+  expect(result.build.gasMist).toBe(100360);
+  expect(result.build.userShareMist).toBe(2129985);
+  expect(result.sponsorNetMist).toBe(384055);
+});
+
+it('does not ask the wallet to sign when the reserved sponsor coin changes the retained amount', async () => {
+  vi.spyOn(Transaction.prototype, 'build').mockResolvedValue(new Uint8Array([1]));
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+    ok: true, json: async () => ({ sponsoredTxBytes: 'AQ==', sponsorAddress: '0x2', sponsorSignature: 'dummy' }),
+  } as Response);
+  vi.spyOn(graphQLClient, 'simulateTransaction').mockResolvedValue({
+    $kind: 'Transaction', Transaction: { status: { success: true },
+      effects: { gasUsed: { computationCost: '200000', storageCost: '0', storageRebate: '1000000' } },
+      balanceChanges: [{ address: '0x2', coinType: '0x2::sui::SUI', amount: '146901' }],
+    },
+  } as never);
+  const sign = vi.fn();
+  const submit = vi.spyOn(graphQLClient, 'executeTransaction');
+  await expect(executeActions([deposit('0xa')], SENDER, sign, 'sponsored')).rejects.toThrow(/could not be verified/);
+  expect(sign).not.toHaveBeenCalled();
+  expect(submit).not.toHaveBeenCalled();
+});
+
+it('remeasures when adding the payout changes storage costs', async () => {
+  vi.spyOn(Transaction.prototype, 'build').mockResolvedValue(new Uint8Array([1]));
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+    ok: true, json: async () => ({ sponsoredTxBytes: 'AQ==', sponsorAddress: '0x2' }),
+  } as Response);
+  const quote = (cost: string) => ({
+    $kind: 'Transaction', Transaction: { status: { success: true },
+      effects: { gasUsed: { computationCost: cost, storageCost: '0', storageRebate: '1000000' } },
+      balanceChanges: [{ address: '0x2', coinType: '0x2::sui::SUI', amount: '146900' }],
+    },
+  }) as never;
+  const simulate = vi.spyOn(graphQLClient, 'simulateTransaction')
+    .mockResolvedValueOnce(quote('200000')).mockResolvedValue(quote('300000'));
+  const result = await simulateActions([deposit('0xa')], SENDER, 'sponsored');
+  expect(simulate).toHaveBeenCalledTimes(4);
+  expect(result.build.userShareMist).toBe(553100);
+  expect(result.sponsorNetMist).toBe(146900);
+});
+
+it('rejects an apparently correct sponsor balance when gas arithmetic disagrees', async () => {
+  vi.spyOn(Transaction.prototype, 'build').mockResolvedValue(new Uint8Array([1]));
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+    ok: true, json: async () => ({ sponsoredTxBytes: 'AQ==', sponsorAddress: '0x2' }),
+  } as Response);
+  const quote = (rebate: string) => ({
+    $kind: 'Transaction', Transaction: { status: { success: true },
+      effects: { gasUsed: { computationCost: '200000', storageCost: '0', storageRebate: rebate } },
+      balanceChanges: [{ address: '0x2', coinType: '0x2::sui::SUI', amount: '146900' }],
+    },
+  }) as never;
+  vi.spyOn(graphQLClient, 'simulateTransaction')
+    .mockResolvedValueOnce(quote('1000000')).mockResolvedValueOnce(quote('1000000'))
+    .mockResolvedValue(quote('900000'));
+  await expect(simulateActions([deposit('0xa')], SENDER, 'sponsored')).rejects.toThrow(/could not be verified/);
 });
 
 it('checks real funding for forced-self kiosk withdrawal even with a funded sponsor requested', async () => {

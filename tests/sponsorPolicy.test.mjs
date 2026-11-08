@@ -522,6 +522,12 @@ test('gasCoinNetMist refuses to sign when the payout exceeds the real rebate', (
   expect(gasCoinNetMist(gasUsed, 7_000_000n) < 0n).toBe(true);
 });
 
+test('corrected mainnet payout retains the fee and allowance without weakening the gas gate', () => {
+  const gas = { computationCost: '100000', storageCost: '988000', storageRebate: '3602040' };
+  expect(gasCoinNetMist(gas, 2_129_985n)).toBe(384_055n);
+  expect(gasCoinNetMist(gas, 2_514_041n)).toBe(-1n);
+});
+
 test('gasCoinNetMist refuses to guess when the gas figures are missing', () => {
   // absent fields are absent evidence - defaulting them to zero would pass the gate on
   // no data, and would do so precisely for the zero-payout griefing shapes

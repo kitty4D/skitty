@@ -34,6 +34,8 @@ each new scan revalidates the public lists. your wallet can apply additional scr
 
 the fee rate is 13.69% of the storage rebate the batch is planned to reclaim. it doesn't apply to token balances or withdrawn kiosk proceeds. the quote applies the app's 0.99 rebate multiplier before subtracting gas and the fee. simulation shows network effects, which can differ from the estimate
 
+for sponsored cleanup, the sponsor retains the service fee plus a 1% allowance on the included objects' storage rebates. the allowance is an app policy, not the network's nonrefundable storage fee. payout planning credits the sponsor gas object's storage rebate against gas costs and measures again if adding the payout changes those costs. final simulation must reconcile both the gas arithmetic and sponsor balance change with the disclosed retention before your wallet is asked to sign
+
 a merge keeps its primary coin, so that object's storage isn't counted as recovered. quotes cover only actions that fit in the batch. anything left out stays available for another run
 
 ### sponsored gas
@@ -67,6 +69,8 @@ gas is measured before signing, with a budget of at least 1.5 times gross cost a
 simulate before signing. a small cleanup can cost more than it recovers
 
 scan results use rough gas allowances. simulating the queue replaces its headline with the sender's simulated net SUI change after gas and fees. sponsored simulation measures gas and rebuilds the payout using the same planning path as execution. changing the selection or gas mode clears the result. the network can still change before execution
+
+simulation separates your net recovery from storage rebate minus gas. sponsored transactions also show the sponsor's simulated net SUI balance change, including its payout to you. missing sponsor balance data is shown as unavailable
 
 the final transaction is checked before the wallet prompt. shared state can still change before execution, and a failed submitted transaction can cost gas. review the wallet's transaction details
 

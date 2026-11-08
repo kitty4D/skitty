@@ -35,6 +35,8 @@ sender payouts now use address balance rather than a replacement SUI coin. `send
 
 simulate-only requests get bytes without a signature. the real signing path performs the simulation and value gates before signing
 
+the official client now prices sponsor gas-object rebates into the payout and verifies exact retained value (service fee plus app 1% allowance) from both final gas arithmetic and sponsor SUI balance changes. it checks the exact sponsor-signed bytes before user signing because reservation may choose a different gas coin. these fairness checks don't replace or relax either server loss gate, and aren't an API-enforced upper fee bound for custom clients
+
 ## why the shared-input rules exist
 
 an earlier attack shape seeded a shared kiosk with profits, routed them to the sponsor to make its simulated balance positive, split gas to the caller, then drained the kiosk before submission

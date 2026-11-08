@@ -22,6 +22,7 @@ read [project memory](docs/memory/MEMORY.md) before changing gas, sponsorship, d
 - `FEE_RECIPIENT` must match the sponsor key's address. never read `.env*` or expose `SUI_SPONSOR_PRIV`
 - empty-payment simulation doesn't prove the payer can afford gas. self-paid planning checks holdings separately
 - recovery quotes prefer final sender balance changes. fallback uses final effects for self-paid and the explicit payout for sponsored. never show the sponsor's rebate as user recovery. queue results belong to one selection and payer
+- sponsored payout credits gas-object rebates. retain only fee plus the app's 1% allowance. converge the payout shape and verify exact final sponsor retention before user signing; keep server loss gates intact. don't label the allowance a protocol burn
 - self-paid address-balance transactions never reference `tx.gas`. fees use withdrawal/redeem/send. coin-paid fees use `coin::send_funds`, avoiding a new fee coin
 - keep-token deposits go only to the sender's address balance. exclude all gas-payment coins. overlapping actions can't share inputs. coin-paid SUI consolidation uses the gas coin
 - coin cleanup revalidates Mysten's coin-type/package lists each scan. flagged coins stay outside Select All and normal totals. explicit unhide allows individual framework-only cleanup with confirmation. hide/rescan/wallet change clears the opt-in. wallet refusals aren't scam verdicts

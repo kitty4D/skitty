@@ -1,6 +1,7 @@
 import { Transaction } from '@mysten/sui/transactions';
 import {
   buildBatchTransaction,
+  computeFeeMist,
   type BuildBatchResult,
   type SelfPaidGasSource,
 } from './buildCleanupTransaction';
@@ -113,10 +114,8 @@ interface GasUsedLike {
 /**
  * What the gas coin is charged before any rebate flows back into it.
  *
- * The rebate must NOT be netted off here: it is already being paid out to the user in
- * full via userRebateMist, so subtracting it again would have the sponsor recoup less
- * than it fronts. For a reclaim batch the rebate exceeds computation + storage, so the
- * netted figure is negative and the sponsor silently eats the difference.
+ * use this for budget sizing, not the sponsored payout. the payout must also credit
+ * rebates from rewriting the sponsor gas coin.
  */
 function grossGasCost(gasUsed: GasUsedLike | undefined | null): number {
   return Number(gasUsed?.computationCost ?? 0) + Number(gasUsed?.storageCost ?? 0);
@@ -280,29 +279,61 @@ async function planSelfPaid(actions: CleanupAction[], sender: string): Promise<S
 // ---- simulate ----
 
 async function planSponsored(actions: CleanupAction[], sender: string) {
-  const draft = await buildKindBytes(actions, sender, null);
-  const response = await requestSponsorship(draft.kindBytes, sender, true);
-  const result = await graphQLClient.simulateTransaction({
-    transaction: base64ToBytes(response.sponsoredTxBytes),
-    include: { effects: true },
-  });
-  if (result.$kind !== 'Transaction' || !result.Transaction.status?.success) {
-    const tx = result.$kind === 'Transaction' ? result.Transaction : result.FailedTransaction;
-    throw new Error(executionErrorMessage(tx?.status?.error) ?? 'Transaction would fail on-chain.');
+  // measure a zero-payout draft, so a rough gas allowance can't reject profitable work.
+  const preview = buildBatchTransaction(actions, { senderAddress: sender });
+  let draft = await buildKindBytes(actions, sender,
+    preview.userRebateMist - computeFeeMist(preview.storageRebateMist));
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const response = await requestSponsorship(draft.kindBytes, sender, true);
+    const result = await graphQLClient.simulateTransaction({
+      transaction: base64ToBytes(response.sponsoredTxBytes),
+      include: { effects: true },
+    });
+    if (result.$kind !== 'Transaction' || !result.Transaction.status?.success) {
+      const tx = result.$kind === 'Transaction' ? result.Transaction : result.FailedTransaction;
+      throw new Error(executionErrorMessage(tx?.status?.error) ?? 'Transaction would fail on-chain.');
+    }
+    if (!result.Transaction.effects?.gasUsed) throw new Error('Dry run failed or no gas data.');
+    const gas = result.Transaction.effects.gasUsed;
+    if (![gas.computationCost, gas.storageCost, gas.storageRebate].every(value =>
+      value != null && Number.isSafeInteger(Number(value)) && Number(value) >= 0)) {
+      throw new Error('Could not verify the sponsored payout.');
+    }
+    // user-object rebates are already in the build. credit only the remaining rebate
+    // here, including the sponsor gas object's rebate, so nothing is counted twice.
+    const recoup = grossGasCost(gas) - Number(gas.storageRebate) + draft.build.storageRebateMist;
+    if (!Number.isSafeInteger(recoup)) throw new Error('Could not verify the sponsored payout.');
+    const next = await buildKindBytes(actions, sender, recoup);
+    if (next.build.userShareMist === draft.build.userShareMist) return draft;
+    draft = next;
   }
-  if (!result.Transaction.effects?.gasUsed) throw new Error('Dry run failed or no gas data.');
-  return buildKindBytes(actions, sender, Math.max(
-    grossGasCost(result.Transaction.effects.gasUsed), draft.build.gasMist
-  ));
+  throw new Error('Sponsor gas costs changed repeatedly. Try a smaller batch.');
+}
+
+function verifySponsorRetention(
+  build: BuildBatchResult,
+  gas: GasUsedLike | null | undefined,
+  balanceChanges: { address?: string; coinType?: string; amount?: string }[] | undefined,
+  sponsor: string,
+) {
+  const retained = build.feeMist + build.storageRebateMist - build.userRebateMist;
+  const sponsorNet = netSuiFor(balanceChanges, sponsor);
+  if (gas?.computationCost == null || gas.storageCost == null || gas.storageRebate == null ||
+      sponsorNet === undefined || !Number.isSafeInteger(sponsorNet) || sponsorNet !== retained ||
+      Number(gas.storageRebate) - grossGasCost(gas) - build.userShareMist !== retained) {
+    throw new Error('Sponsor gas costs changed or could not be verified. Simulate again before executing.');
+  }
 }
 
 export interface SimulationOutcome {
   build: BuildBatchResult;
   gasMode: GasMode;
   gasCostMist: number;
+  /** null for self-paid transactions; undefined when sponsor balance changes are missing */
+  sponsorNetMist?: number | null;
   /** actual SUI the sender gains, straight from the simulated balance changes */
   netInflowMist?: number;
-  /** rebate - gas - fee, used when balance changes are unavailable */
+  /** sender balance change, or the final payout/effects calculation when unavailable */
   netGainMist: number;
   success: boolean;
   executionError: string | null;
@@ -321,13 +352,15 @@ export async function simulateActions(
   gasMode = gasModeForActions(actions, gasMode);
   let build: BuildBatchResult;
   let txBytes: Uint8Array;
+  let sponsorAddress: string | null = null;
   if (gasMode === 'self') {
     ({ build, bytes: txBytes } = await planSelfPaid(actions, senderAddress));
   } else {
     // use execution's measured payout plan before asking for the final simulation.
     const kind = await planSponsored(actions, senderAddress);
     build = kind.build;
-    const { sponsoredTxBytes } = await requestSponsorship(kind.kindBytes, senderAddress, true);
+    const { sponsoredTxBytes, sponsorAddress: payer } = await requestSponsorship(kind.kindBytes, senderAddress, true);
+    sponsorAddress = payer;
     txBytes = base64ToBytes(sponsoredTxBytes);
   }
 
@@ -353,6 +386,9 @@ export async function simulateActions(
   if (!effects) {
     throw new Error('No effects from dry run.');
   }
+  if (sponsorAddress && result.$kind === 'Transaction' && txResult?.status?.success) {
+    verifySponsorRetention(build, effects.gasUsed, txResult.balanceChanges, sponsorAddress);
+  }
   // display uses the net figure (what the transaction costs after the rebate lands)
   const gasCostMist = netGasCost(effects.gasUsed);
   const netInflowMist = netSuiFor(txResult?.balanceChanges, senderAddress);
@@ -366,6 +402,7 @@ export async function simulateActions(
     build,
     gasMode,
     gasCostMist,
+    sponsorNetMist: sponsorAddress == null ? null : netSuiFor(txResult?.balanceChanges, sponsorAddress),
     netInflowMist,
     netGainMist,
     success: result.$kind === 'Transaction' && Boolean(txResult?.status?.success),
@@ -469,7 +506,7 @@ async function executeSelfPaid(
 }
 
 /**
- * sponsored: measure gas, rebuild with the conservative recoup allowance, get the
+ * sponsored: measure net costs, rebuild with the disclosed retention, get the
  * sponsor signature, have the user sign, and submit. self-paid: measure,
  * pin the budget, have the user sign, and submit.
  */
@@ -494,6 +531,18 @@ export async function executeActions(
     senderAddress,
     false
   );
+
+  // the signing endpoint can reserve a different coin from the measuring request.
+  // check those exact signed bytes before requesting the user's signature.
+  const preflight = await graphQLClient.simulateTransaction({
+    transaction: base64ToBytes(sponsoredTxBytes),
+    include: { effects: true, balanceChanges: true },
+  });
+  if (preflight.$kind !== 'Transaction' || !preflight.Transaction.status?.success) {
+    throw new Error('Sponsored transaction changed or would fail. Simulate again.');
+  }
+  verifySponsorRetention(final.build, preflight.Transaction.effects?.gasUsed,
+    preflight.Transaction.balanceChanges, sponsorAddress);
 
   const { bytes: signedTxBytes, signature: userSignature } = await signTransaction({
     transaction: Transaction.from(sponsoredTxBytes),
