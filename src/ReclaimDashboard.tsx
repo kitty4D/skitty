@@ -19,6 +19,7 @@ import { useSponsorStatus } from './useSponsorStatus';
 import { useSuiHoldings } from './useSuiHoldings';
 import { actionKey, actionDomId, selectActionKeys, bulkSelectableActions } from './actionIdentity';
 import { selectCleanupGas } from './gasSelection';
+import { sectionForKind } from './scanPipeline';
 import { totalNonOverlappingNetGainMist } from './coinActions';
 import { SELF_PAY_MIN_GAS_BUDGET_MIST } from './constants';
 import type { CleanupAction } from './types';
@@ -246,7 +247,7 @@ export function ReclaimDashboard() {
     ...state.actions, ...(showFlaggedCoins ? state.flaggedActions ?? [] : []),
   ], [state.actions, state.flaggedActions, showFlaggedCoins]);
   React.useEffect(() => {
-    if (state.loading) { setShowFlaggedCoins(false); setPendingConfirm(null); }
+    if (state.loading) { setShowFlaggedCoins(false); setPendingConfirm(null); setSelectedKeys(new Set()); }
   }, [state.loading]);
 
   const toggleAction = React.useCallback((key: string) => {
@@ -746,7 +747,7 @@ export function ReclaimDashboard() {
                 )}
               </AnimatePresence>
 
-              {state.scannedAddress && !state.loading && (
+              {state.scannedAddress && (
                 <div className="mt-6 flex items-center gap-2">
                   <span className="text-[10px] font-black uppercase text-skitty-secondary">Current Target:</span>
                   <code className="bg-skitty-accent/20 text-skitty-accent px-2 py-1 text-xs font-bold border border-skitty-accent/30 uppercase tracking-wider">
@@ -796,10 +797,11 @@ export function ReclaimDashboard() {
           <ScanProgressPanel
             progress={state.scanProgress}
             exiting={false}
+            sections={state.scanSections}
           />
         )}
 
-        {!state.loading && state.scannedAddress && (
+        {state.scannedAddress && (
           <motion.div
             variants={containerVariants}
             initial="hidden"
@@ -810,10 +812,10 @@ export function ReclaimDashboard() {
               <div>
                 <h2 className="font-display font-black text-4xl uppercase tracking-tighter leading-none">Recoverable Assets</h2>
                 <p className="text-xs font-black uppercase tracking-widest text-skitty-accent mt-2">
-                  Est. net potential: {formatSui(totalNonOverlappingNetGainMist(state.actions))} SUI
+                  {state.loading ? 'Partial results / rough net potential so far' : 'Est. net potential'}: {formatSui(totalNonOverlappingNetGainMist(state.actions))} SUI
                 </p>
                 <p className="text-[9px] font-mono text-skitty-secondary/70 mt-0.5">
-                  Based on current state; actual amounts at execution may differ.
+                  {state.loading ? 'more results may arrive. browse now; selection and transaction controls unlock when scanning finishes.' : 'Based on current state; actual amounts at execution may differ.'}
                 </p>
               </div>
             </div>
@@ -825,7 +827,7 @@ export function ReclaimDashboard() {
                   setPayGasWithWallet(value);
                   setPendingConfirm(null);
                 }}
-                disabled={executing || simulating}
+                disabled={state.loading || executing || simulating}
                 requiresWalletGas={forcedSelf}
                 blockedReason={forcedSelf ? forcedNoGasReason : payGasWithWallet ? noGasReason : null}
               />
@@ -834,6 +836,8 @@ export function ReclaimDashboard() {
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
               {kindOrder.map((kind) => {
                 const items = actionsByKind.get(kind) ?? [];
+                const section = state.scanSections?.find(item => item.id === sectionForKind[kind]);
+                if (state.loading && items.length === 0 && section?.status !== 'complete' && section?.status !== 'error') return null;
                 if (items.length === 0 && !reviewKinds.has(kind)) return null;
                 return (
                   <motion.div
@@ -846,7 +850,7 @@ export function ReclaimDashboard() {
                         {kindTitles[kind]}
                       </h3>
                       <div className="flex items-center gap-2">
-                        {scannedAddressIsConnectedWallet && showSelectAllForKind(kind) && (
+                        {scannedAddressIsConnectedWallet && !state.loading && showSelectAllForKind(kind) && (
                           <Button
                             type="button"
                             variant="outline"
@@ -862,6 +866,7 @@ export function ReclaimDashboard() {
                         </span>
                       </div>
                     </div>
+                    {state.loading && <p className="px-4 py-2 text-xs text-skitty-secondary bg-black/30">{section?.status === 'complete' ? 'checks complete for this panel' : section?.status === 'error' ? 'scan incomplete: review warnings' : 'verified results so far; this panel is still being checked'}</p>}
                     {kind === 'keep_tokens' && (
                       <div className="p-4 bg-green-500/10 border-b border-green-500/20 text-sm space-y-2">
                         <p className="text-green-300 font-bold">your tokens stay yours. no swap, burn, or donation.</p>
@@ -882,8 +887,8 @@ export function ReclaimDashboard() {
                           onToggle={() => toggleAction(key)}
                           shortLabel={shortLabelFromType(action.label ?? action.objectIds[0] ?? '')}
                           notEconomical={action.netGainMist < 0}
-                          interactive={scannedAddressIsConnectedWallet}
-                          showSimulate
+                          interactive={scannedAddressIsConnectedWallet && !state.loading}
+                          showSimulate={!state.loading}
                           simulatedNetInflowMist={simulatedNetInflowByKey[key]}
                           onDryRun={() => runSimulation([action], key)}
                           onExecute={() => requestExecute([action])}
@@ -919,7 +924,7 @@ export function ReclaimDashboard() {
                   these match Mysten's public blocklists or an exact coin type reported blocked by Slush. Select All never includes them, even when unhidden. a wallet refusal doesn't establish that a token is a scam
                 </p>
                 <label className="mt-4 flex cursor-pointer items-start gap-3 text-sm text-white">
-                  <input type="checkbox" checked={showFlaggedCoins} disabled={executing || simulating}
+                  <input type="checkbox" checked={showFlaggedCoins} disabled={state.loading || executing || simulating}
                     onChange={event => { setShowFlaggedCoins(event.target.checked); setPendingConfirm(null); }}
                     aria-describedby="flagged-coin-help" className="mt-1 h-4 w-4 shrink-0 accent-skitty-accent" />
                   show cleanup options for flagged coins
@@ -970,7 +975,7 @@ export function ReclaimDashboard() {
       </main>
 
       <AnimatePresence>
-        {scannedAddressIsConnectedWallet && selectedKeys.size > 0 && (
+        {!state.loading && scannedAddressIsConnectedWallet && selectedKeys.size > 0 && (
           <motion.div
             initial={{ y: 100, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
@@ -1005,6 +1010,7 @@ export function ReclaimDashboard() {
               lastSponsorImpact={lastSponsorImpact}
               isMinimized={isCartMinimized}
               onToggleMinimize={() => setIsCartMinimized(!isCartMinimized)}
+              dismissOnOutsideClick={!pendingConfirm && !simulationModal && !showRawSimulation && !executing}
             />
           </motion.div>
         )}

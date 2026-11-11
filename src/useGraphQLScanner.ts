@@ -29,6 +29,7 @@ import { generateCoinActions, partitionBlockedCoins, parseCoinBalance, totalUniq
 import type { CoinMetadata } from './coinActions';
 import { discoverContainers, containerType } from './containerDiscovery';
 import { discoverReceipts, isReceiptType } from './receiptDiscovery';
+import { mapScanItems, runScanPipeline, type ScanResults } from './scanPipeline';
 
 const COIN_TYPE_PREFIX = '0x2::coin::coin<';
 
@@ -39,7 +40,7 @@ async function runQuery(options: {
   query: string;
   variables: Record<string, unknown>;
 }): Promise<{ data: unknown }> {
-  const { data, errors } = await graphQLClient.query(options);
+  const { data, errors } = await graphQLClient.query({ ...options, signal: AbortSignal.timeout(20_000) });
   if (errors?.length) {
     throw new Error(`Sui GraphQL error: ${errors[0]!.message}`);
   }
@@ -83,75 +84,50 @@ export function useGraphQLScanner(address: string | null) {
       warnings: [],
       blockedCoins: [],
       flaggedActions: [],
+      scanSections: [],
       totalUserRebateMist: 0,
       scannedAddress: address,
     }));
 
     try {
       refreshWalletBlocklists();
-      const updateProgress = (progress: ScanProgress) => {
+      const filterExtras = async (result: ScanResults): Promise<ScanResults> => {
+        const blocklist = await getWalletObjectBlocklist();
+        return { ...result, actions: result.actions.filter(action =>
+          !('objectType' in action) || !isObjectTypeBlockedIn(blocklist, action.objectType)) };
+      };
+      await runScanPipeline([
+        { id: 'coins', label: 'coins and token balances', run: (progress, publish) =>
+          findCoinActionsByGraphQL(address, progress, publish, isStale) },
+        { id: 'kiosks', label: 'kiosks and sale proceeds', run: async (progress, publish) => ({
+          actions: await findEmptyKiosksByGraphQL(address, progress, publish, isStale),
+        }) },
+        { id: 'containers', label: 'empty containers', run: async progress => {
+          let pages = 0;
+          const actions = await discoverContainers(graphQLClient, address, () =>
+            progress({ phase: 'reading owned-object pages', current: ++pages, total: 0 }));
+          return filterExtras({ actions });
+        } },
+        { id: 'receipts', label: 'Walrus receipts and allowances', run: async progress => {
+          let pages = 0;
+          const result = await discoverReceipts(graphQLClient, address, () =>
+            progress({ phase: 'checking receipts and allowance caps', current: ++pages, total: 0 }));
+          return filterExtras(result);
+        } },
+        { id: 'burn', label: 'other objects and burn functions', run: async (progress, publish) => ({
+          actions: await findBurnableObjects(address, progress, publish, isStale),
+        }) },
+      ], snapshot => {
         if (isStale()) return;
-        setState(prev => ({ ...prev, scanProgress: progress }));
-      };
-
-      updateProgress({ phase: 'fetching coins', current: 0, total: 1 });
-      const coinResults = await findCoinActionsByGraphQL(address, updateProgress);
-
-      updateProgress({ phase: 'fetching kiosks', current: 0, total: 1 });
-      const kioskResult = await findEmptyKiosksByGraphQL(address, updateProgress);
-
-      updateProgress({ phase: 'checking containers and receipts', current: 0, total: 1 });
-      let discoveryPages = 0;
-      const discoveryProgress = () => {
-        discoveryPages += 1;
-        updateProgress({phase:'checking containers and receipts',current:discoveryPages,total:discoveryPages+1});
-      };
-      const extraResults = await Promise.allSettled([
-        discoverContainers(graphQLClient, address, discoveryProgress), discoverReceipts(graphQLClient, address, discoveryProgress),
-      ]);
-      const warnings: string[] = [];
-      const extraActions: CleanupAction[] = [];
-      for (const [index, result] of extraResults.entries()) {
-        if (result.status === 'rejected') {
-          warnings.push(`${index === 0 ? 'container' : 'Walrus and allowance'} scan incomplete: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
-        } else if (Array.isArray(result.value)) extraActions.push(...result.value);
-        else { extraActions.push(...result.value.actions); warnings.push(...result.value.warnings); }
-      }
-      const objectBlocklist = await getWalletObjectBlocklist();
-      const allowedExtras = extraActions.filter(action => !('objectType' in action) || !isObjectTypeBlockedIn(objectBlocklist, action.objectType));
-
-      updateProgress({ phase: 'fetching NFTs', current: 0, total: 1 });
-      const burnableResult = await findBurnableObjects(address, updateProgress);
-
-      if (isStale()) return;
-
-      const actions: CleanupAction[] = [
-        ...coinResults.actions,
-        ...kioskResult,
-        ...burnableResult,
-        ...allowedExtras,
-      ];
-      const totalUserRebateMist = totalUniqueUserRebateMist(actions);
-
-      setState(prev => ({
-        ...prev,
-        loading: false,
-        scanProgress: null,
-        actions,
-        blockedCoins: coinResults.blockedCoins,
-        flaggedActions: coinResults.flaggedActions,
-        warnings,
-        totalUserRebateMist,
-        scannedAddress: address,
-      }));
+        setState(prev => ({ ...prev, ...snapshot, totalUserRebateMist: totalUniqueUserRebateMist(snapshot.actions) }));
+      }, isStale);
+      if (!isStale()) setState(prev => ({ ...prev, loading: false, scanProgress: null }));
     } catch (error) {
       if (isStale()) return;
       setState(prev => ({
         ...prev,
         loading: false,
         scanProgress: null,
-        actions: [],
-        totalUserRebateMist: 0,
         error: error instanceof Error ? error.message : String(error),
       }));
     }
@@ -176,6 +152,7 @@ export function useGraphQLScanner(address: string | null) {
       warnings: [],
       blockedCoins: [],
       flaggedActions: [],
+      scanSections: [],
     }));
   }, [address]);
 
@@ -185,7 +162,9 @@ export function useGraphQLScanner(address: string | null) {
 // find mergeable coins and zero-balance (destroy_zero) via GraphQL; returns both as CleanupAction[]
 async function findCoinActionsByGraphQL(
   address: string,
-  updateProgress: (progress: ScanProgress) => void
+  updateProgress: (progress: ScanProgress) => void,
+  publish: (results: ScanResults) => void = () => {},
+  isStale: () => boolean = () => false,
 ): Promise<{actions: CleanupAction[]; blockedCoins: import('./types').BlockedCoin[]; flaggedActions: CleanupAction[]}> {
   updateProgress({ phase: 'fetching coins', current: 0, total: 1 });
 
@@ -201,6 +180,7 @@ async function findCoinActionsByGraphQL(
   {
     let pageCount = 0;
     while (true) {
+      if (isStale()) return { actions: [], blockedCoins: [], flaggedActions: [] };
       const variables: { owner: string; after?: string } = { owner: address };
       if (after != null) variables.after = after;
 
@@ -227,7 +207,7 @@ async function findCoinActionsByGraphQL(
       const nodes = connection?.nodes ?? [];
       coins.push(...nodes);
       pageCount += 1;
-      updateProgress({ phase: 'fetching coins', current: pageCount, total: pageCount + 1 });
+      updateProgress({ phase: `reading coin page ${pageCount}: ${coins.length} objects found`, current: pageCount, total: 0 });
 
       // a connection may legally return fewer than `first` nodes and still have more
       // pages, so drive the loop off hasNextPage rather than the node count
@@ -235,22 +215,32 @@ async function findCoinActionsByGraphQL(
       if (!connection?.pageInfo?.hasNextPage || !endCursor) break;
       after = endCursor;
     }
-    updateProgress({ phase: 'analyzing coins', current: 0, total: coins.length });
+    updateProgress({ phase: `checking safety lists for ${coins.length} coin objects`, current: 0, total: 0 });
 
     const [blocklist, packageBlocklist] = await Promise.all([getWalletCoinBlocklist(), getWalletPackageBlocklist()]);
     const {allowed, blockedCoins} = partitionBlockedCoins(coins, blocklist, packageBlocklist);
     const metadata = new Map<string, CoinMetadata>();
+    const flaggedIds = new Set(blockedCoins.map(coin => coin.objectId));
+    const flaggedActions = generateCoinActions(coins.filter(coin => flaggedIds.has(coin.address)), new Set()).map(action => ({
+      ...action,
+      walletWarning:'this coin type or package is flagged. your wallet may refuse to sign. this is an explicit cleanup request, not a verification that the token is legitimate.',
+    }));
+    const results = () => ({ actions: generateCoinActions(allowed, blocklist, metadata), blockedCoins, flaggedActions });
+    // raw balances are safe to display after list checks. decimals can arrive later.
+    publish(results());
     const blocked = new Set([...blocklist].map(normalizeTypeAddress));
     const types = new Set(allowed.filter(coin => {
       const balance = parseCoinBalance(coin.contents?.json);
       return balance !== null && balance > 0n;
     }).map(coin => coin.contents?.type?.repr).filter((type): type is string => !!type));
-    // sequential requests keep large wallets from flooding the metadata endpoint.
-    for (const coinType of types) {
+    let checked = 0;
+    const metadataTypes = [...types].filter(type => !isSameMoveType(getCoinTypeArg(type), '0x2::sui::SUI'));
+    updateProgress({ phase: 'loading token names and decimals', current: 0, total: metadataTypes.length });
+    await mapScanItems(metadataTypes, async coinType => {
       const inner = getCoinTypeArg(coinType);
-      if (blocked.has(normalizeTypeAddress(inner)) || isSameMoveType(inner, '0x2::sui::SUI')) continue;
+      if (blocked.has(normalizeTypeAddress(inner))) return;
       try {
-        const { coinMetadata } = await graphQLClient.getCoinMetadata({ coinType: inner });
+        const { coinMetadata } = await graphQLClient.getCoinMetadata({ coinType: inner, signal: AbortSignal.timeout(20_000) });
         if (coinMetadata) metadata.set(coinType, {
           ...(typeof coinMetadata.symbol === 'string' && coinMetadata.symbol ? { tokenSymbol: coinMetadata.symbol } : {}),
           ...(Number.isInteger(coinMetadata.decimals) && coinMetadata.decimals >= 0 && coinMetadata.decimals <= 255
@@ -259,20 +249,20 @@ async function findCoinActionsByGraphQL(
       } catch {
         // display metadata is optional; retain raw balances when unavailable.
       }
-    }
-    const flaggedIds = new Set(blockedCoins.map(coin => coin.objectId));
-    const flaggedActions = generateCoinActions(coins.filter(coin => flaggedIds.has(coin.address)), new Set()).map(action => ({
-      ...action,
-      walletWarning:'this coin type or package is flagged. your wallet may refuse to sign. this is an explicit cleanup request, not a verification that the token is legitimate.',
-    }));
-    return {actions:generateCoinActions(allowed, blocklist, metadata),blockedCoins,flaggedActions};
+      checked++;
+      updateProgress({ phase: 'loading token names and decimals', current: checked, total: metadataTypes.length });
+      publish(results());
+    }, isStale);
+    return results();
   }
 }
 
 // find empty kiosks via GraphQL; only suggest "close kiosk" when we have an owned KioskOwnerCap whose "for" = kiosk id (never suggest closing one we don't own the cap for)
 async function findEmptyKiosksByGraphQL(
   address: string,
-  updateProgress: (progress: ScanProgress) => void
+  updateProgress: (progress: ScanProgress) => void,
+  publish: (results: ScanResults) => void = () => {},
+  isStale: () => boolean = () => false,
 ): Promise<(CloseKioskAction | WithdrawKioskAction)[]> {
   updateProgress({ phase: 'fetching kiosk caps', current: 0, total: 1 });
 
@@ -288,6 +278,7 @@ async function findEmptyKiosksByGraphQL(
   // paginate: a wallet with more than one page of caps would otherwise have the rest
   // of its closeable kiosks silently ignored
   while (true) {
+    if (isStale()) return [];
     const variables: { owner: string; after?: string } = { owner: address };
     if (after != null) variables.after = after;
 
@@ -319,6 +310,7 @@ async function findEmptyKiosksByGraphQL(
 
     const connection = (capsData as AddressObjects)?.address?.objects;
     kioskCaps.push(...(connection?.nodes ?? []));
+    updateProgress({ phase: `reading kiosk caps: ${kioskCaps.length} found`, current: kioskCaps.length, total: 0 });
     const endCursor = connection?.pageInfo?.endCursor ?? null;
     if (!connection?.pageInfo?.hasNextPage || !endCursor) break;
     after = endCursor;
@@ -331,14 +323,13 @@ async function findEmptyKiosksByGraphQL(
   if (isObjectTypeBlockedIn(objectBlocklist, KIOSK_TYPE)) return closeActions;
   let current = 0;
 
-  for (const cap of kioskCaps) {
-    current++;
-    updateProgress({ phase: 'checking kiosks', current, total: kioskCaps.length });
+  await mapScanItems(kioskCaps, async cap => {
+    try {
     const json = cap.contents?.json;
     const kioskId = json?.for ?? null;
-    if (!kioskId) continue;
+    if (!kioskId) return;
     const kiosk = await inspectKiosk(kioskId);
-    if (!kiosk) continue;
+    if (!kiosk) return;
     if (BigInt(kiosk.profitsRaw) > 0n) {
       closeActions.push({kind:'withdraw_kiosk',kioskId,ownerCapId:cap.address,
         proceedsMist:kiosk.profitsRaw,selfPaidOnly:true,label:kioskId,
@@ -346,13 +337,13 @@ async function findEmptyKiosksByGraphQL(
         userRebateMist:0,estimatedGasMist:2_000_000,netGainMist:Number(kiosk.profitsRaw)-2_000_000,
         details:[`sale proceeds: ${kiosk.profitsRaw} mist`, 'kiosk and owner capability stay open']});
     }
-    if (!kiosk.empty) continue;
+    if (!kiosk.empty) return;
     // closing deletes BOTH the kiosk and its owner cap, so both rebates come back
     const capRebate = Number(cap.storageRebate ?? 0);
     const storageRebateTotal = capRebate + kiosk.storageRebateMist;
     const userRebateMist = Math.floor(storageRebateTotal * REBATE_MULTIPLIER);
     const feeMist = computeFeeMist(storageRebateTotal);
-    if (userRebateMist < est + feeMist) continue;
+    if (userRebateMist < est + feeMist) return;
     closeActions.push({
       kind: 'close_kiosk',
       kioskId,
@@ -366,7 +357,12 @@ async function findEmptyKiosksByGraphQL(
       estimatedGasMist: est,
       netGainMist: userRebateMist - est - feeMist,
     });
-  }
+    } finally {
+      current++;
+      updateProgress({ phase: 'checking kiosk contents and sale proceeds', current, total: kioskCaps.length });
+      if (current === 1 || current % 10 === 0 || current === kioskCaps.length) publish({ actions: [...closeActions] });
+    }
+  }, isStale);
   return closeActions;
 }
 
@@ -430,7 +426,7 @@ async function inspectKiosk(
   }
 }
 
-// RPC-based burn discovery helpers
+// Move function discovery helpers
 function parseMoveType(
   typeStr: string
 ): { package: string; module: string; name: string; typeArgs?: string[] } | null {
@@ -529,7 +525,9 @@ async function findBurnFunction(objectType: string): Promise<string | null> {
 // find burnable objects: page through owned objects, group by type, look for a burn entry point
 async function findBurnableObjects(
   address: string,
-  updateProgress: (progress: ScanProgress) => void
+  updateProgress: (progress: ScanProgress) => void,
+  publish: (results: ScanResults) => void = () => {},
+  isStale: () => boolean = () => false,
 ): Promise<BurnAction[]> {
   updateProgress({ phase: 'fetching NFTs', current: 0, total: 1 });
 
@@ -545,6 +543,7 @@ async function findBurnableObjects(
     let pageCount = 0;
 
     while (true) {
+      if (isStale()) return [];
       const variables: { owner: string; after?: string } = { owner: address };
       if (after != null) variables.after = after;
 
@@ -588,7 +587,7 @@ async function findBurnableObjects(
         });
       }
       pageCount += 1;
-      updateProgress({ phase: 'fetching NFTs', current: pageCount, total: pageCount + 1 });
+      updateProgress({ phase: `reading owned-object page ${pageCount}: ${objects.length} objects found`, current: pageCount, total: 0 });
 
       const endCursor = connection?.pageInfo?.endCursor ?? null;
       if (!connection?.pageInfo?.hasNextPage || !endCursor) break;
@@ -619,8 +618,9 @@ async function findBurnableObjects(
     updateProgress({ phase: 'discovering burn', current: 0, total: types.length });
 
     for (let i = 0; i < types.length; i++) {
-      updateProgress({ phase: 'discovering burn', current: i + 1, total: types.length });
+      if (isStale()) return burnActions;
       const objectType = types[i];
+      updateProgress({ phase: `checking burn functions: ${objectType.slice(objectType.indexOf('::') + 2)}`, current: i, total: types.length });
       if (isObjectTypeBlockedIn(objectBlocklist, objectType)) continue;
       const list = byType.get(objectType)!;
       let moveTarget: string | null = null;
@@ -665,6 +665,7 @@ async function findBurnableObjects(
         netGainMist: userRebateMist - gasEst - feeMist,
         label: shortType,
       });
+      publish({ actions: [...burnActions] });
     }
     return burnActions;
   }

@@ -1,4 +1,5 @@
 import { motion, AnimatePresence } from 'framer-motion';
+import { useEffect, useRef } from 'react';
 import { Trash2, ChevronDown, ChevronUp, PartyPopper } from 'lucide-react';
 import { Button } from './ui/button';
 import { kioskProceedsMist } from '../sponsoredTx';
@@ -32,6 +33,7 @@ export function FloatingCart({
   lastSponsorImpact = null,
   isMinimized,
   onToggleMinimize,
+  dismissOnOutsideClick = true,
 }: {
   selectedActionList: CleanupAction[];
   /** gross storage rebate this batch actually reclaims */
@@ -63,13 +65,25 @@ export function FloatingCart({
   lastSponsorImpact?: { digest: string; netMist: number } | null;
   isMinimized: boolean;
   onToggleMinimize: () => void;
+  dismissOnOutsideClick?: boolean;
 }) {
+  const queueRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (isMinimized || !dismissOnOutsideClick) return;
+    const outside = (event: PointerEvent) => {
+      if (!(event.target instanceof Node) || queueRef.current?.contains(event.target)) return;
+      if (event.target instanceof Element && event.target.closest('[role="dialog"], [aria-modal="true"]')) return;
+      onToggleMinimize();
+    };
+    document.addEventListener('pointerdown', outside);
+    return () => document.removeEventListener('pointerdown', outside);
+  }, [isMinimized, dismissOnOutsideClick, onToggleMinimize]);
   const forcedSelf = selectedActionList.some((a) => a.selfPaidOnly || a.kind === 'withdraw_kiosk');
   if (forcedSelf) gasMode = 'self';
   const measured = dryRunResult?.forQueue && !dryRunResult.error;
   const displayedShareMist = measured ? dryRunResult.netGainMist : userShareMist;
   return (
-    <div className="relative pointer-events-auto w-full max-w-lg">
+    <div ref={queueRef} className="relative pointer-events-auto w-full max-w-lg">
       <AnimatePresence mode="wait">
         {isMinimized ? (
           <motion.button

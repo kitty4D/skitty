@@ -4,6 +4,7 @@ these notes describe the current implementation and keep dated observations sepa
 
 - [gas modes](gas-modes.md): sponsorship, voluntary self-payment, gas planning, and wallet feedback
 - [coin cleanup](coin-cleanup.md): keep-token deposits, SUI consolidation, exact balances, and overlapping choices
+- [scan progress](scan-progress.md): incremental panels, bounded discovery, incomplete results, and queue dismissal
 - [object cleanup](object-cleanup.md): empty containers, Walrus receipts, kiosk proceeds, and native allowances
 - [sponsor checks](sponsor-trust-boundary.md): what the hot key signs, value bounds, and remaining risks
 - [gas observations](sui-gas-facts.md): rebates, address balances, withdrawals, and verification limits

@@ -32,6 +32,7 @@ read [project memory](docs/memory/MEMORY.md) before changing gas, sponsorship, d
 - Walrus expiry uses Walrus committee time. keep the pinned system/package checks. exclude recognized receipts from generic burn discovery, including live receipts
 - allowance review covers native Sui caps only. revoke uses owned cap first, matching allowance second. don't call this a review of every protocol permission
 - show incomplete discovery as a warning. require confirmation for object cleanup. wallet changes clear feedback and pending confirmations
+- publish only checked scan results; metadata may enrich raw balances later. keep partial results labeled, per-section status accurate, and transaction controls locked until scan settles. outside clicks minimize the queue without clearing selections; don't dismiss through open review dialogs
 - no commits, branches, pushes, deployments, or signed onchain actions without explicit authorization. this docs update isn't commit permission
 
 ## docs and voice

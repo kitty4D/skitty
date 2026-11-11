@@ -90,7 +90,16 @@ export interface ScanProgress {
   total: number;
 }
 
+export type ScanSectionId = 'coins' | 'kiosks' | 'containers' | 'receipts' | 'burn';
+export interface ScanSection extends ScanProgress {
+  id: ScanSectionId;
+  label: string;
+  status: 'waiting' | 'scanning' | 'complete' | 'error';
+  found: number;
+}
+
 export interface ScannerState {
+  scanSections?: ScanSection[];
   blockedCoins?: BlockedCoin[];
   flaggedActions?: CleanupAction[];
   warnings?: string[];
