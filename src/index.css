@@ -50,3 +50,43 @@ body {
 .label-scroll::-webkit-scrollbar-thumb:hover {
   background: rgba(168, 85, 247, 0.6);
 }
+
+/* the kit caps menu height without scrolling; extra accounts used to escape its background. */
+[data-dapp-kit][role='menu'] {
+  box-sizing: border-box;
+  width: min(20rem, calc(100vw - 2rem));
+  max-width: calc(100vw - 2rem);
+  max-height: min(28rem, var(--radix-dropdown-menu-content-available-height, calc(100dvh - 5rem)));
+  margin-top: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  background-color: #111114;
+  color: #fff;
+  border: 1px solid #9333ea;
+  scrollbar-width: thin;
+  scrollbar-color: #a855f7 #111114;
+}
+
+[data-dapp-kit][role='menu'] [role='menuitem'] {
+  flex-shrink: 0;
+  min-height: 44px;
+  gap: 12px;
+  color: #fff;
+  cursor: pointer;
+}
+
+[data-dapp-kit][role='menu'] [role='menuitem'] * {
+  color: inherit;
+}
+
+[data-dapp-kit][role='menu'] [role='menuitem'] > :first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+[data-dapp-kit][role='menu'] [role='menuitem'][data-highlighted] {
+  background-color: #6b21a8;
+}

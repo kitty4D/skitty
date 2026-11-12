@@ -33,6 +33,7 @@ read [project memory](docs/memory/MEMORY.md) before changing gas, sponsorship, d
 - allowance review covers native Sui caps only. revoke uses owned cap first, matching allowance second. don't call this a review of every protocol permission
 - show incomplete discovery as a warning. require confirmation for object cleanup. wallet changes clear feedback and pending confirmations
 - publish only checked scan results; metadata may enrich raw balances later. keep partial results labeled, per-section status accurate, and transaction controls locked until scan settles. outside clicks minimize the queue without clearing selections; don't dismiss through open review dialogs
+- queue dismissal is idempotent and uses capture events; don't wait for exit animation to remove its hit area. keep dapp-kit account-menu overrides scoped and viewport-bounded; verify long lists with keyboard and touch-sized screens
 - no commits, branches, pushes, deployments, or signed onchain actions without explicit authorization. this docs update isn't commit permission
 
 ## docs and voice

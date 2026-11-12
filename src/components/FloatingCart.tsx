@@ -1,4 +1,4 @@
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { useEffect, useRef } from 'react';
 import { Trash2, ChevronDown, ChevronUp, PartyPopper } from 'lucide-react';
 import { Button } from './ui/button';
@@ -33,6 +33,7 @@ export function FloatingCart({
   lastSponsorImpact = null,
   isMinimized,
   onToggleMinimize,
+  onMinimize,
   dismissOnOutsideClick = true,
 }: {
   selectedActionList: CleanupAction[];
@@ -65,32 +66,39 @@ export function FloatingCart({
   lastSponsorImpact?: { digest: string; netMist: number } | null;
   isMinimized: boolean;
   onToggleMinimize: () => void;
+  onMinimize: () => void;
   dismissOnOutsideClick?: boolean;
 }) {
   const queueRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (isMinimized || !dismissOnOutsideClick) return;
-    const outside = (event: PointerEvent) => {
+    const outside = (event: Event) => {
       if (!(event.target instanceof Node) || queueRef.current?.contains(event.target)) return;
       if (event.target instanceof Element && event.target.closest('[role="dialog"], [aria-modal="true"]')) return;
-      onToggleMinimize();
+      onMinimize();
     };
-    document.addEventListener('pointerdown', outside);
-    return () => document.removeEventListener('pointerdown', outside);
-  }, [isMinimized, dismissOnOutsideClick, onToggleMinimize]);
+    // capture runs before page controls or portaled menus can swallow the event.
+    // pointerdown and keyboard-generated clicks both dismiss; setting true is idempotent.
+    window.addEventListener('pointerdown', outside, true);
+    window.addEventListener('click', outside, true);
+    return () => {
+      window.removeEventListener('pointerdown', outside, true);
+      window.removeEventListener('click', outside, true);
+    };
+  }, [isMinimized, dismissOnOutsideClick, onMinimize]);
   const forcedSelf = selectedActionList.some((a) => a.selfPaidOnly || a.kind === 'withdraw_kiosk');
   if (forcedSelf) gasMode = 'self';
   const measured = dryRunResult?.forQueue && !dryRunResult.error;
   const displayedShareMist = measured ? dryRunResult.netGainMist : userShareMist;
   return (
     <div ref={queueRef} className="relative pointer-events-auto w-full max-w-lg">
-      <AnimatePresence mode="wait">
+      <>
         {isMinimized ? (
           <motion.button
             key="minimized-trigger"
-            initial={{ y: 100, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            exit={{ y: 100, opacity: 0 }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.12 }}
             onClick={onToggleMinimize}
             className="flex items-center gap-3 px-8 py-4 bg-black border-3 border-skitty-accent shadow-brutal text-white font-black uppercase tracking-tighter hover:bg-skitty-accent transition-all group pointer-events-auto mx-auto"
           >
@@ -101,14 +109,13 @@ export function FloatingCart({
         ) : (
           <motion.div
             key="expanded-cart"
-            initial={{ y: 100, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            exit={{ y: 100, opacity: 0 }}
-            transition={{ type: 'spring', stiffness: 260, damping: 20 }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.12 }}
             className="bg-black border-3 border-skitty-accent shadow-[12px_12px_0_#000] p-6 w-full relative"
           >
             <button
-              onClick={onToggleMinimize}
+              onClick={onMinimize}
               className="absolute -top-3 -right-3 p-2 bg-black border-2 border-skitty-accent text-skitty-accent hover:text-white hover:bg-skitty-accent transition-all z-10"
               title="HIDE QUEUE"
             >
@@ -297,7 +304,7 @@ export function FloatingCart({
             </div>
           </motion.div>
         )}
-      </AnimatePresence>
+      </>
     </div>
   );
 }

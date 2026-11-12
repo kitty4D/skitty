@@ -1009,7 +1009,8 @@ export function ReclaimDashboard() {
               executeBlockedReason={cartBlockedReason}
               lastSponsorImpact={lastSponsorImpact}
               isMinimized={isCartMinimized}
-              onToggleMinimize={() => setIsCartMinimized(!isCartMinimized)}
+              onToggleMinimize={() => setIsCartMinimized(value => !value)}
+              onMinimize={() => setIsCartMinimized(true)}
               dismissOnOutsideClick={!pendingConfirm && !simulationModal && !showRawSimulation && !executing}
             />
           </motion.div>

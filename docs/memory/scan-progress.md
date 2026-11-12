@@ -15,3 +15,11 @@ november 11 read-only browser check: `premierjon.sui` had 354 coin objects, 84 a
 ## queue dismissal
 
 an outside pointer click minimizes the open queue without clearing selections. clicks inside don't dismiss it. the minimized button reopens it. dismissal is disabled during execution and while a confirmation, simulation popup, or raw simulation view is open. no modal overlay is added, so the page remains usable
+
+dismissal uses window capture for pointerdown and click, so page handlers that stop bubbling don't block it and keyboard-generated clicks work. dismissal sets minimized state explicitly; it doesn't toggle twice across pointerdown and click. the expanded panel unmounts immediately rather than waiting for a spring exit. the previous connected-app exit took about 0.9 seconds and left a nearly invisible panel present until it settled
+
+## connected account menu
+
+the installed dapp-kit account menu has max-height 200px but no overflow scrolling. with 24 accounts it painted only a 200px background while menu items occupied over 1,000px. `src/index.css` scopes overrides to `[data-dapp-kit][role='menu']`: bounded width, opaque background, scrollable content, nonshrinking rows, and height limited by Radix's available viewport space. no vendor files are edited
+
+browser verification uses a mock wallet with 24 accounts and signing methods that always throw. it covers full connected dashboard queue dismissal, stopped event propagation, keyboard clicks, review cancellation, scrolling to and selecting account 24, and keyboard End reaching Disconnect at desktop and 390px mobile widths. mock reads don't prove real wallet signing or onchain behavior

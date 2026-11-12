@@ -9,7 +9,7 @@ function renderQuote(dryRunResult: Parameters<typeof FloatingCart>[0]['dryRunRes
     feeMist={0} estimatedGasMist={1000000} userShareMist={1000000}
     dryRunResult={dryRunResult} executeError={null} runDryRun={noop} execute={noop}
     onClearQueue={noop} onViewRawSimulation={noop} executing={false}
-    accountConnected={false} isMinimized={false} onToggleMinimize={noop}
+    accountConnected={false} isMinimized={false} onToggleMinimize={noop} onMinimize={noop}
   />);
 }
 

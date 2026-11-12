@@ -70,6 +70,8 @@ scan results appear progressively as checks finish. the progress panel shows act
 
 clicking outside the open queue minimizes it without clearing the selection. use **view queue** to reopen it
 
+the connected account menu scrolls within the available screen height, keeping long account lists and the disconnect control accessible
+
 simulate before signing. a small cleanup can cost more than it recovers
 
 scan results use rough gas allowances. simulating the queue replaces its headline with the sender's simulated net SUI change after gas and fees. sponsored simulation measures gas and rebuilds the payout using the same planning path as execution. changing the selection or gas mode clears the result. the network can still change before execution
